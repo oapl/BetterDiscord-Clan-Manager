@@ -2,13 +2,29 @@
  * @name OfficerMode
  * @author Codex
  * @description Adds a toggleable officer desk for ticket and application channels while keeping the main chat readable.
- * @version 0.1.6
+ * @version 0.2.6
  */
 
 const PLUGIN_NAME = "OfficerMode";
 const SETTINGS_KEY = "settings";
 const STYLE_ID = "OfficerMode";
 const DISCORD_EPOCH = 1420070400000n;
+const SHARE_SCAN_DATA_KEY = "robloxShareScan";
+const ROBLOX_SHARE_SCAN = {
+    SERVER_LOGS_CHANNEL_ID: "1489879731569426485",
+    EGG_CHAT_CHANNEL_ID: "1515759898565148884",
+    AUDIT_AUTHOR_IDS: ["165533461241659403"],
+    SHARE_PREFIX: "https://www.roblox.com/share",
+    SHARE_PATTERNS: [
+        /https?:\/\/(?:www\.)?roblox\.com\/share\?code=/i,
+        /https?:\/\/(?:www\.)?roblox\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?games\/8737899170\/Pet-Simulator-99\?privateServerLinkCode=/i,
+        /(?:^|\s)\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?games\/8737899170\/Pet-Simulator-99\?privateServerLinkCode=/i
+    ],
+    START_MS: new Date(2026, 5, 13, 10, 0, 0).getTime(),
+    END_MS: new Date(2026, 5, 19, 10, 0, 0).getTime(),
+    PAGE_LIMIT: 100,
+    MAX_PAGES: 800
+};
 
 const CHANNEL_TYPES = {
     GUILD_TEXT: 0,
@@ -224,6 +240,11 @@ const CSS = `
 .om-icon-button:hover {
     background: var(--background-modifier-hover, rgba(255, 255, 255, 0.08));
     color: var(--interactive-hover, #fff);
+}
+
+.om-icon-button:disabled {
+    opacity: 0.55;
+    cursor: wait;
 }
 
 .om-controls {
@@ -677,6 +698,38 @@ function toArrayDeep(value, output = [], seen = new Set(), depth = 0) {
     return output;
 }
 
+function toMessageArray(value, output = [], seen = new Set(), depth = 0) {
+    if (!value || output.length > 1500 || depth > 5) return output;
+    if (Array.isArray(value)) {
+        for (const item of value) toMessageArray(item, output, seen, depth + 1);
+        return output;
+    }
+    if (value instanceof Map || value instanceof Set) {
+        value.forEach(item => toMessageArray(item, output, seen, depth + 1));
+        return output;
+    }
+    if (typeof value !== "object") return output;
+    if (seen.has(value)) return output;
+    seen.add(value);
+
+    if (typeof value.toArray === "function") {
+        try {
+            toMessageArray(value.toArray(), output, seen, depth + 1);
+        }
+        catch (_) {}
+    }
+
+    if (value.id && (value.content !== undefined || value.embeds !== undefined || value.timestamp !== undefined)) {
+        output.push(value);
+        return output;
+    }
+
+    for (const key of ["_array", "array", "messages", "items", "records", "_map", "map", "cache"]) {
+        if (value[key]) toMessageArray(value[key], output, seen, depth + 1);
+    }
+    return output;
+}
+
 function collectSnowflakeIds(value, output = new Set(), seen = new Set(), depth = 0) {
     if (!value || output.size > 1200 || depth > 5) return output;
     if (typeof value === "string") {
@@ -712,6 +765,15 @@ function snowflakeToTimestamp(id) {
     }
 }
 
+function timestampToSnowflake(timestamp) {
+    try {
+        return String((BigInt(Math.max(0, Number(timestamp) || 0)) - DISCORD_EPOCH) << 22n);
+    }
+    catch (_) {
+        return "";
+    }
+}
+
 function timestampFromMessage(message) {
     if (!message) return 0;
     const timestamp = message.timestamp || message.editedTimestamp;
@@ -739,6 +801,18 @@ function formatAge(timestamp) {
     return new Date(timestamp).toLocaleDateString(undefined, {month: "short", day: "numeric"});
 }
 
+function formatDuration(ms) {
+    const totalMinutes = Math.max(0, Math.floor((Number(ms) || 0) / 60000));
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    const parts = [];
+    if (days) parts.push(`${days}d`);
+    if (hours) parts.push(`${hours}h`);
+    if (minutes || !parts.length) parts.push(`${minutes}m`);
+    return parts.join(" ");
+}
+
 function compareByActivity(a, b) {
     if (b.mentions !== a.mentions) return b.mentions - a.mentions;
     if (Number(b.unread) !== Number(a.unread)) return Number(b.unread) - Number(a.unread);
@@ -750,6 +824,17 @@ function compareByPosition(a, b) {
     if (a.categoryPosition !== b.categoryPosition) return a.categoryPosition - b.categoryPosition;
     if (a.position !== b.position) return a.position - b.position;
     return a.name.localeCompare(b.name);
+}
+
+function cleanLogText(value) {
+    return String(value || "")
+        .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\r\n?/g, "\n");
+}
+
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 module.exports = class OfficerMode {
@@ -766,6 +851,7 @@ module.exports = class OfficerMode {
         this.modules = {};
         this.unsubscribe = [];
         this.interval = null;
+        this.shareScanRunning = false;
         this.onStoreChange = debounce(() => {
             if (this.settings.enabled) this.render();
             else this.renderToggle();
@@ -973,7 +1059,11 @@ module.exports = class OfficerMode {
             NavigationTransition: findByStrings("transitionTo - Transitioning to "),
             NavigationGuildTransition: findByKeys("transitionToGuildSync")?.transitionToGuildSync || null,
             Router: findByKeys("transitionTo", "replaceWith") || findByKeys("transitionToGuild"),
-            ChannelActions: findByKeys("selectChannel", "selectVoiceChannel") || findByKeys("selectChannel")
+            ChannelActions: findByKeys("selectChannel", "selectVoiceChannel") || findByKeys("selectChannel"),
+            MessageActions: findByKeys("fetchMessages", "sendMessage")
+                || findByKeys("fetchMessages")
+                || findByKeys("loadMessages")
+                || findByStrings("fetchMessages")
         };
     }
 
@@ -1176,12 +1266,18 @@ module.exports = class OfficerMode {
             this.render();
         });
 
+        const shareScan = createElement("button", "om-icon-button", this.shareScanRunning ? "..." : "S");
+        shareScan.type = "button";
+        shareScan.title = "Scan Roblox share logs";
+        shareScan.disabled = this.shareScanRunning;
+        shareScan.addEventListener("click", () => this.runRobloxShareScan());
+
         const close = createElement("button", "om-icon-button", "X");
         close.type = "button";
         close.title = "Close Officer Mode";
         close.addEventListener("click", () => this.setEnabled(false));
 
-        header.append(title, refresh, close);
+        header.append(title, shareScan, refresh, close);
         return header;
     }
 
@@ -1590,41 +1686,1096 @@ module.exports = class OfficerMode {
     }
 
     async fetchThreadEndpoint(endpoint) {
+        return this.fetchDiscordEndpoint(endpoint);
+    }
+
+    async fetchDiscordEndpoint(endpoint) {
+        const detail = arguments[1] || {};
         const http = this.modules.HTTP;
         const apiPath = endpoint.startsWith("/api/") ? endpoint : `/api/v9${endpoint}`;
         const url = endpoint.startsWith("/api/") ? endpoint : endpoint;
+        const absoluteUrl = `https://discord.com${apiPath}`;
         const attempts = [];
 
         if (typeof http?.get === "function") {
-            attempts.push(() => http.get({url}));
-            attempts.push(() => http.get({url: apiPath}));
-            attempts.push(() => http.get(url));
-            attempts.push(() => http.get(apiPath));
+            attempts.push(["http object apiPath", () => http.get({url: apiPath})]);
+            attempts.push(["http object absolute", () => http.get({url: absoluteUrl})]);
+            if (endpoint.startsWith("/api/")) attempts.push(["http object url", () => http.get({url})]);
+            attempts.push(["http string apiPath", () => http.get(apiPath)]);
+            attempts.push(["http string absolute", () => http.get(absoluteUrl)]);
+            if (endpoint.startsWith("/api/")) attempts.push(["http string url", () => http.get(url)]);
         }
 
-        for (const attempt of attempts) {
+        for (const [name, attempt] of attempts) {
             try {
                 const result = await attempt();
-                return result?.body || result;
+                const normalized = await this.readFetchResponse(result);
+                this.recordFetchAttempt(detail, name, result, normalized);
+                if (this.shouldAcceptDiscordResponse(normalized, detail)) return normalized;
+            }
+            catch (error) {
+                this.recordFetchAttempt(detail, name, null, null, error);
+            }
+        }
+
+        if (detail.internalOnly) return null;
+
+        const token = this.getDiscordToken();
+        const headers = token ? {Authorization: token} : undefined;
+        if (typeof BdApi.Net?.fetch === "function") {
+            try {
+                const response = await BdApi.Net.fetch(absoluteUrl, {method: "GET", headers});
+                const data = await this.readFetchResponse(response);
+                this.recordFetchAttempt(detail, "BdApi.Net.fetch absolute", response, data);
+                if (this.shouldAcceptDiscordResponse(data, detail)) return data;
+            }
+            catch (error) {
+                this.recordFetchAttempt(detail, "BdApi.Net.fetch absolute", null, null, error);
+            }
+        }
+
+        try {
+            const response = await fetch(absoluteUrl, {credentials: "include", headers});
+            const data = await this.readFetchResponse(response);
+            this.recordFetchAttempt(detail, "fetch absolute", response, data);
+            if (response.ok && this.shouldAcceptDiscordResponse(data, detail)) return data;
+        }
+        catch (error) {
+            this.recordFetchAttempt(detail, "fetch absolute", null, null, error);
+        }
+
+        try {
+            const response = await fetch(apiPath, {credentials: "include", headers});
+            const data = await this.readFetchResponse(response);
+            this.recordFetchAttempt(detail, "fetch relative", response, data);
+            if (response.ok && this.shouldAcceptDiscordResponse(data, detail)) return data;
+        }
+        catch (error) {
+            this.recordFetchAttempt(detail, "fetch relative", null, null, error);
+        }
+
+        return null;
+    }
+
+    shouldAcceptDiscordResponse(value, detail = {}) {
+        if (value === undefined || value === null || this.isDiscordErrorResponse(value)) return false;
+        if (!detail.expectMessages) return true;
+        if (Array.isArray(value)) return true;
+        return Array.isArray(value?.messages)
+            || Array.isArray(value?.body)
+            || Array.isArray(value?.data)
+            || Array.isArray(value?.body?.messages)
+            || Array.isArray(value?.data?.messages)
+            || Array.isArray(value?.results);
+    }
+
+    normalizeDiscordResponse(result) {
+        let value = this.getResponsePayload(result);
+        for (let index = 0; index < 3; index += 1) {
+            if (value && typeof value === "object" && typeof value.json === "function") break;
+            if (value?.body !== undefined) value = value.body;
+            else if (value?.data !== undefined) value = value.data;
+            else if (value?.response?.body !== undefined) value = value.response.body;
+            else if (value?.response?.data !== undefined) value = value.response.data;
+            else if (value?.rawBody !== undefined) value = value.rawBody;
+            else if (typeof value?.text === "string") value = value.text;
+            else break;
+        }
+        if (typeof value === "string") {
+            try {
+                return JSON.parse(value);
             }
             catch (_) {}
         }
+        return value;
+    }
 
-        const token = safeCall(this.modules.Auth, "getToken");
-        const headers = token ? {Authorization: token} : undefined;
+    getResponsePayload(response) {
+        if (!response || typeof response !== "object") return response;
+        for (const key of ["body", "data", "rawBody", "responseBody"]) {
+            if (response[key] !== undefined && response[key] !== "") return response[key];
+        }
+        const xhr = response.xhr || response.req?.xhr || response.request?.xhr;
+        if (xhr) {
+            for (const key of ["responseJSON", "response", "responseText"]) {
+                if (xhr[key] !== undefined && xhr[key] !== "") return xhr[key];
+            }
+        }
+        const req = response.req || response.request;
+        if (req) {
+            for (const key of ["responseJSON", "response", "responseText", "text"]) {
+                if (req[key] !== undefined && req[key] !== "" && typeof req[key] !== "function") return req[key];
+            }
+        }
+        for (const key of ["text", "responseText", "response"]) {
+            if (response[key] !== undefined && response[key] !== "" && typeof response[key] !== "function") return response[key];
+        }
+        return response;
+    }
+
+    isDiscordErrorResponse(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        return typeof value.message === "string" && (
+            value.code !== undefined
+            || /401|403|unauthorized|missing access|missing permissions|rate limit/i.test(value.message)
+        );
+    }
+
+    async readFetchResponse(response) {
+        if (!response) return null;
+        const payload = this.getResponsePayload(response);
+        if (payload !== response) return this.normalizeDiscordResponse(payload);
+        if (typeof response.json === "function") {
+            try {
+                return this.normalizeDiscordResponse(await response.json());
+            }
+            catch (_) {}
+        }
+        if (typeof response.text === "function") {
+            try {
+                const text = await response.text();
+                return this.normalizeDiscordResponse(text ? JSON.parse(text) : null);
+            }
+            catch (_) {}
+        }
+        return this.normalizeDiscordResponse(response);
+    }
+
+    getDiscordToken() {
+        const authToken = this.getTokenFromAuthModule(this.modules.Auth);
+        if (authToken) return authToken;
+
         try {
-            const response = await fetch(apiPath, {credentials: "include", headers});
-            if (response.ok) return await response.json();
+            const raw = localStorage.getItem("token");
+            const parsed = raw ? String(JSON.parse(raw)) : "";
+            if (this.looksLikeDiscordToken(parsed)) return parsed;
         }
         catch (_) {}
 
         try {
-            const response = await fetch(`https://discord.com${apiPath}`, {credentials: "include", headers});
-            if (response.ok) return await response.json();
+            const raw = localStorage.getItem("token");
+            const token = raw ? raw.replace(/^"+|"+$/g, "") : "";
+            if (this.looksLikeDiscordToken(token)) return token;
         }
         catch (_) {}
 
-        return null;
+        return "";
+    }
+
+    getTokenFromAuthModule(module) {
+        const candidates = [
+            module,
+            module?.default,
+            module?.Z,
+            module?.ZP,
+            module?.exports,
+            module?.exports?.default
+        ];
+        for (const candidate of candidates) {
+            const token = safeCall(candidate, "getToken");
+            if (this.looksLikeDiscordToken(token)) return String(token);
+        }
+        return "";
+    }
+
+    looksLikeDiscordToken(value) {
+        const token = String(value || "");
+        return token.length > 20 && token !== "undefined" && token !== "null";
+    }
+
+    recordFetchAttempt(detail, method, response, data, error = null) {
+        if (!detail?.attempts) return;
+        const status = response?.status || response?.statusCode || response?.body?.status || "";
+        const dataType = Array.isArray(data) ? "array" : (data === null ? "null" : typeof data);
+        const dataSize = Array.isArray(data)
+            ? data.length
+            : Array.isArray(data?.body)
+                ? data.body.length
+                : Array.isArray(data?.data)
+                    ? data.data.length
+            : Array.isArray(data?.messages)
+                ? data.messages.length
+                : Array.isArray(data?.body?.messages)
+                    ? data.body.messages.length
+                    : "";
+        const dataKeys = data && typeof data === "object" && !Array.isArray(data)
+            ? Object.keys(data).slice(0, 10).join(" ")
+            : "";
+        const responseKeys = response && typeof response === "object" && !Array.isArray(response)
+            ? Object.keys(response).slice(0, 10).join(" ")
+            : "";
+        const preview = this.getFetchPreview(response, data);
+        detail.attempts.push({
+            method,
+            status,
+            ok: response?.ok ?? "",
+            dataType,
+            dataSize,
+            dataKeys,
+            responseKeys,
+            preview,
+            error: error?.message || "",
+            message: typeof data?.message === "string" ? data.message : ""
+        });
+    }
+
+    getFetchPreview(response, data) {
+        const candidates = [
+            data,
+            this.getResponsePayload(response),
+            response?.text,
+            response?.xhr?.responseText,
+            response?.xhr?.response,
+            response?.req?.responseText,
+            response?.req?.response
+        ];
+        for (const candidate of candidates) {
+            if (candidate === undefined || candidate === null) continue;
+            let text = "";
+            try {
+                text = typeof candidate === "string" ? candidate : JSON.stringify(candidate);
+            }
+            catch (_) {
+                text = Object.prototype.toString.call(candidate);
+            }
+            if (text) return cleanLogText(text).slice(0, 220);
+        }
+        return "";
+    }
+
+    async runRobloxShareScan() {
+        if (this.shareScanRunning) return;
+
+        this.shareScanRunning = true;
+        this.render();
+        BdApi.UI?.showToast?.("Scanning Roblox share logs and #egg-chat...", {type: "info"});
+
+        try {
+            const result = await this.scanRobloxShareLogs();
+            BdApi.Data.save(PLUGIN_NAME, SHARE_SCAN_DATA_KEY, result);
+            this.exportShareScanResult(result);
+
+            try {
+                await navigator.clipboard?.writeText?.(this.formatShareScanSummary(result));
+            }
+            catch (_) {}
+
+            BdApi.UI?.showToast?.(
+                `Share scan complete: ${result.totalMatches} posts across ${result.summary.length} members.`,
+                {type: "success"}
+            );
+        }
+        catch (error) {
+            console.error(`${PLUGIN_NAME} share scan failed`, error);
+            BdApi.UI?.showToast?.("Share scan failed. Check the console for details.", {type: "error"});
+        }
+        finally {
+            this.shareScanRunning = false;
+            this.render();
+        }
+    }
+
+    async scanRobloxShareLogs() {
+        const startMs = ROBLOX_SHARE_SCAN.START_MS;
+        const requestedEndMs = ROBLOX_SHARE_SCAN.END_MS;
+        const endMs = requestedEndMs;
+        const generatedAtMs = Date.now();
+        const matches = [];
+        const diagnostics = {
+            inWindowMessages: 0,
+            shareAnywhereMessages: 0,
+            eggChannelMessages: 0,
+            messageFieldShareMessages: 0,
+            liveEggChannelMessages: 0,
+            liveEggShareMessages: 0,
+            fetches: [],
+            liveFetches: [],
+            authorAudit: [],
+            samples: []
+        };
+        let before = timestampToSnowflake(endMs + 1) || "";
+        let scannedMessages = 0;
+        let pages = 0;
+        let reachedStart = false;
+        let breakReason = "";
+
+        while (!reachedStart && pages < ROBLOX_SHARE_SCAN.MAX_PAGES) {
+            const fetchDetail = {page: pages + 1, before, expectMessages: true, internalOnly: true, attempts: []};
+            diagnostics.fetches.push(fetchDetail);
+            const endpoint = [
+                `/channels/${ROBLOX_SHARE_SCAN.SERVER_LOGS_CHANNEL_ID}/messages?limit=${ROBLOX_SHARE_SCAN.PAGE_LIMIT}`,
+                before ? `&before=${before}` : ""
+            ].join("");
+            const messages = await this.fetchMessagesWithDiscordActions(ROBLOX_SHARE_SCAN.SERVER_LOGS_CHANNEL_ID, before, fetchDetail);
+            fetchDetail.messageCount = messages.length;
+            fetchDetail.responseType = "message-action";
+            fetchDetail.endpoint = endpoint;
+            if (!messages.length) {
+                breakReason = "message action returned no usable message array";
+                break;
+            }
+
+            pages += 1;
+            fetchDetail.firstMessageId = messages[0]?.id || "";
+            fetchDetail.lastMessageId = messages[messages.length - 1]?.id || "";
+            fetchDetail.firstTimestamp = messages[0]?.timestamp || "";
+            fetchDetail.lastTimestamp = messages[messages.length - 1]?.timestamp || "";
+            for (const message of messages) {
+                scannedMessages += 1;
+                const timestamp = timestampFromMessage(message);
+                if (timestamp && timestamp < startMs) {
+                    reachedStart = true;
+                    continue;
+                }
+                if (!timestamp || timestamp > endMs || timestamp < startMs) continue;
+
+                const inspection = this.inspectRobloxShareLogMessage(message, timestamp);
+                diagnostics.inWindowMessages += 1;
+                if (inspection.hasShareAnywhere) diagnostics.shareAnywhereMessages += 1;
+                if (inspection.hasEggChannel) diagnostics.eggChannelMessages += 1;
+                if (inspection.hasMessageFieldShare) diagnostics.messageFieldShareMessages += 1;
+                if (diagnostics.samples.length < 120 && (inspection.hasShareAnywhere || inspection.hasEggChannel || inspection.authorValues || diagnostics.samples.length < 20)) {
+                    diagnostics.samples.push(inspection);
+                }
+
+                const match = this.getRobloxShareLogMatch(message, timestamp, inspection);
+                this.recordRobloxShareAuthorAudit(diagnostics, message, timestamp, inspection, match);
+                if (match) matches.push(match);
+            }
+
+            before = messages[messages.length - 1]?.id || "";
+            if (!before) break;
+            if (!reachedStart) await wait(175);
+        }
+
+        if (!breakReason) {
+            breakReason = reachedStart
+                ? "reached scan start time"
+                : pages >= ROBLOX_SHARE_SCAN.MAX_PAGES
+                    ? "hit max page limit"
+                    : "completed";
+        }
+
+        const liveResult = await this.scanLiveEggChatShares(startMs, endMs, diagnostics, generatedAtMs);
+        const liveMatches = liveResult.matches;
+        const summary = this.summarizeShareScanMatches(matches, liveMatches);
+        return {
+            generatedAt: new Date().toISOString(),
+            serverLogsChannelId: ROBLOX_SHARE_SCAN.SERVER_LOGS_CHANNEL_ID,
+            sourceChannelId: ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID,
+            sharePrefix: ROBLOX_SHARE_SCAN.SHARE_PREFIX,
+            start: new Date(startMs).toISOString(),
+            end: new Date(endMs).toISOString(),
+            requestedEnd: new Date(requestedEndMs).toISOString(),
+            pagesScanned: pages,
+            scannedMessages,
+            breakReason,
+            liveBreakReason: liveResult.breakReason,
+            livePagesScanned: liveResult.pagesScanned,
+            liveScannedMessages: liveResult.scannedMessages,
+            activeTimeCalculatedAt: liveResult.activeUntil,
+            cappedByMaxPages: pages >= ROBLOX_SHARE_SCAN.MAX_PAGES && !reachedStart,
+            serverLogMatches: matches.length,
+            liveEggChatMatches: liveMatches.length,
+            totalMatches: matches.length + liveMatches.length,
+            diagnostics,
+            summary,
+            liveMatches,
+            matches
+        };
+    }
+
+    async scanLiveEggChatShares(startMs, endMs, diagnostics, generatedAtMs = Date.now()) {
+        const activeUntilMs = Math.min(generatedAtMs, endMs);
+        const matches = [];
+        let before = timestampToSnowflake(activeUntilMs + 1) || "";
+        let scannedMessages = 0;
+        let pages = 0;
+        let reachedStart = false;
+        let breakReason = "";
+
+        while (!reachedStart && pages < ROBLOX_SHARE_SCAN.MAX_PAGES) {
+            const fetchDetail = {
+                source: "egg-chat-live",
+                channelId: ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID,
+                page: pages + 1,
+                before,
+                expectMessages: true,
+                internalOnly: true,
+                attempts: []
+            };
+            diagnostics.liveFetches.push(fetchDetail);
+            const endpoint = [
+                `/channels/${ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID}/messages?limit=${ROBLOX_SHARE_SCAN.PAGE_LIMIT}`,
+                before ? `&before=${before}` : ""
+            ].join("");
+            const messages = await this.fetchMessagesWithDiscordActions(ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID, before, fetchDetail);
+            fetchDetail.messageCount = messages.length;
+            fetchDetail.responseType = "message-action";
+            fetchDetail.endpoint = endpoint;
+            if (!messages.length) {
+                breakReason = "message action returned no usable live egg-chat message array";
+                break;
+            }
+
+            pages += 1;
+            fetchDetail.firstMessageId = messages[0]?.id || "";
+            fetchDetail.lastMessageId = messages[messages.length - 1]?.id || "";
+            fetchDetail.firstTimestamp = messages[0]?.timestamp || "";
+            fetchDetail.lastTimestamp = messages[messages.length - 1]?.timestamp || "";
+
+            for (const message of messages) {
+                scannedMessages += 1;
+                const timestamp = timestampFromMessage(message);
+                if (timestamp && timestamp < startMs) {
+                    reachedStart = true;
+                    continue;
+                }
+                if (!timestamp || timestamp > activeUntilMs || timestamp > endMs || timestamp < startMs) continue;
+
+                diagnostics.liveEggChannelMessages += 1;
+                const match = this.getRobloxShareLiveMatch(message, timestamp, activeUntilMs);
+                if (!match) continue;
+                diagnostics.liveEggShareMessages += 1;
+                matches.push(match);
+            }
+
+            before = messages[messages.length - 1]?.id || "";
+            if (!before) break;
+            if (!reachedStart) await wait(175);
+        }
+
+        if (!breakReason) {
+            breakReason = reachedStart
+                ? "reached scan start time"
+                : pages >= ROBLOX_SHARE_SCAN.MAX_PAGES
+                    ? "hit max page limit"
+                    : "completed";
+        }
+
+        return {
+            matches,
+            pagesScanned: pages,
+            scannedMessages,
+            breakReason,
+            activeUntil: new Date(activeUntilMs).toISOString()
+        };
+    }
+
+    extractDiscordMessages(response) {
+        const value = this.normalizeDiscordResponse(response);
+        if (Array.isArray(value)) return value;
+        if (Array.isArray(value?.body)) return value.body;
+        if (Array.isArray(value?.data)) return value.data;
+        if (Array.isArray(value?.messages)) {
+            return value.messages.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+        }
+        if (Array.isArray(value?.body?.messages)) {
+            return value.body.messages.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+        }
+        if (Array.isArray(value?.results)) {
+            return value.results.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+        }
+        return [];
+    }
+
+    async fetchMessagesWithDiscordActions(channelId, before, detail = {}) {
+        const actions = this.modules.MessageActions;
+        if (!actions) {
+            this.recordActionAttempt(detail, "message actions unavailable", 0, "");
+            return [];
+        }
+
+        const methods = ["fetchMessages", "loadMessages"].filter(method => typeof actions[method] === "function");
+        const attempts = [];
+        for (const method of methods) {
+            attempts.push([`${method} object`, () => actions[method]({channelId, before, limit: ROBLOX_SHARE_SCAN.PAGE_LIMIT})]);
+            attempts.push([`${method} object guild`, () => actions[method]({channelId, guildId: this.getGuildId(), before, limit: ROBLOX_SHARE_SCAN.PAGE_LIMIT})]);
+            attempts.push([`${method} args`, () => actions[method](channelId, {before, limit: ROBLOX_SHARE_SCAN.PAGE_LIMIT})]);
+            attempts.push([`${method} args bool`, () => actions[method](channelId, before, ROBLOX_SHARE_SCAN.PAGE_LIMIT)]);
+        }
+
+        for (const [name, attempt] of attempts) {
+            try {
+                const result = await attempt();
+                await wait(550);
+                const messages = this.extractActionMessages(result, channelId, before);
+                this.recordActionAttempt(detail, name, messages.length, result);
+                if (messages.length) return messages;
+            }
+            catch (error) {
+                this.recordActionAttempt(detail, name, 0, "", error);
+            }
+        }
+
+        const cachedMessages = this.getCachedMessagesForChannel(channelId, before);
+        this.recordActionAttempt(detail, "message cache final", cachedMessages.length, "");
+        return cachedMessages;
+    }
+
+    extractActionMessages(result, channelId, before) {
+        const directMessages = this.extractDiscordMessages(result)
+            .concat(toMessageArray(result));
+        const cachedMessages = this.getCachedMessagesForChannel(channelId, before);
+        return this.filterMessagePage(directMessages.concat(cachedMessages), before);
+    }
+
+    getCachedMessagesForChannel(channelId, before) {
+        const store = this.stores.MessageStore;
+        const sources = [
+            safeCall(store, "getMessages", channelId),
+            safeCall(store, "getMessagesForChannel", channelId),
+            safeCall(store, "getMessageIds", channelId),
+            safeCall(store, "getRawMessages", channelId)
+        ];
+        const messages = [];
+        for (const source of sources) {
+            messages.push(...toMessageArray(source));
+            for (const id of collectSnowflakeIds(source)) {
+                const message = safeCall(store, "getMessage", channelId, id)
+                    || safeCall(store, "getMessage", id)
+                    || safeCall(store, "getMessageById", channelId, id)
+                    || safeCall(store, "getMessageById", id);
+                if (message) messages.push(message);
+            }
+        }
+        return this.filterMessagePage(messages, before);
+    }
+
+    filterMessagePage(messages, before) {
+        const beforeTime = snowflakeToTimestamp(before) || Infinity;
+        const deduped = new Map();
+        for (const message of messages) {
+            if (!message?.id) continue;
+            const timestamp = timestampFromMessage(message) || snowflakeToTimestamp(message.id);
+            if (timestamp && timestamp >= beforeTime) continue;
+            deduped.set(message.id, message);
+        }
+        return Array.from(deduped.values())
+            .sort((a, b) => (timestampFromMessage(b) || snowflakeToTimestamp(b.id)) - (timestampFromMessage(a) || snowflakeToTimestamp(a.id)))
+            .slice(0, ROBLOX_SHARE_SCAN.PAGE_LIMIT);
+    }
+
+    recordActionAttempt(detail, method, messageCount, result, error = null) {
+        if (!detail?.attempts) return;
+        const resultType = Array.isArray(result) ? "array" : (result === null || result === undefined ? "null" : typeof result);
+        const resultKeys = result && typeof result === "object" && !Array.isArray(result)
+            ? Object.keys(result).slice(0, 10).join(" ")
+            : "";
+        detail.attempts.push({
+            method,
+            status: "action",
+            ok: "",
+            dataType: resultType,
+            dataSize: messageCount,
+            dataKeys: resultKeys,
+            responseKeys: "",
+            preview: this.getFetchPreview(null, result),
+            error: error?.message || "",
+            message: ""
+        });
+    }
+
+    inspectRobloxShareLogMessage(message, timestamp) {
+        const text = this.flattenDiscordMessage(message);
+        const channelValues = this.getLogFieldValues(message, "Channel", text);
+        const messageValues = this.getLogFieldValues(message, "Message", text);
+        const authorValues = this.getLogFieldValues(message, "Message author", text)
+            .concat(this.getLogFieldValues(message, "Author", text))
+            .concat(this.getLogFieldValues(message, "User", text));
+        const hasShareAnywhere = this.hasSupportedRobloxShareLink(text);
+        const hasEggChannel = this.hasEggChatReference(text, channelValues);
+        const hasMessageFieldShare = messageValues.some(value => this.hasSupportedRobloxShareLink(value));
+
+        return {
+            logMessageId: message?.id || "",
+            timestamp: new Date(timestamp).toISOString(),
+            hasShareAnywhere,
+            hasEggChannel,
+            hasMessageFieldShare,
+            channelValues: Array.from(new Set(channelValues)).join(" | "),
+            authorValues: Array.from(new Set(authorValues)).join(" | "),
+            messageValues: messageValues.filter(value => this.hasSupportedRobloxShareLink(value)).slice(0, 3).join(" | "),
+            preview: text.slice(0, 700)
+        };
+    }
+
+    getRobloxShareLogMatch(message, timestamp, inspection = null) {
+        const text = this.flattenDiscordMessage(message);
+        const check = inspection || this.inspectRobloxShareLogMessage(message, timestamp);
+        if (!check.hasEggChannel) return null;
+
+        const messageValues = this.getLogFieldValues(message, "Message", text);
+        const shareMessage = this.getShareMessageValue(messageValues, text);
+        if (!shareMessage) return null;
+
+        const authorLine = this.getFirstLogFieldValue(message, ["Message author", "Message Author", "Author", "User"], text)
+            || this.extractMentionPair(text)
+            || "Unknown author";
+        const authorKey = this.normalizeShareAuthorKey(authorLine);
+        const guildId = this.getGuildId() || this.getChannelGuildId(message) || "@me";
+        return {
+            author: authorLine,
+            authorKey,
+            logMessageId: message.id,
+            timestamp: new Date(timestamp).toISOString(),
+            messageUrl: `https://discord.com/channels/${guildId}/${ROBLOX_SHARE_SCAN.SERVER_LOGS_CHANNEL_ID}/${message.id}`,
+            message: shareMessage
+        };
+    }
+
+    getRobloxShareLiveMatch(message, timestamp, activeUntilMs) {
+        const text = this.flattenDiscordMessage(message);
+        const shareMessage = this.getShareMessageValue([], text);
+        if (!shareMessage || !this.hasSupportedRobloxShareLink(shareMessage)) return null;
+
+        const authorLine = this.getLiveMessageAuthorLine(message);
+        const authorId = this.getLiveMessageAuthorId(message);
+        const authorKey = authorId ? `<@${authorId}>` : this.normalizeShareAuthorKey(authorLine);
+        const guildId = this.getGuildId() || this.getChannelGuildId(message) || "@me";
+        const activeMs = Math.max(0, activeUntilMs - timestamp);
+        return {
+            source: "egg-chat-live",
+            author: authorLine,
+            authorKey,
+            liveMessageId: message.id,
+            timestamp: new Date(timestamp).toISOString(),
+            activeMs,
+            activeDuration: formatDuration(activeMs),
+            messageUrl: `https://discord.com/channels/${guildId}/${ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID}/${message.id}`,
+            message: shareMessage
+        };
+    }
+
+    getLiveMessageAuthorId(message) {
+        const author = this.readObjectValue(message, ["author"]) || {};
+        return this.readTextValue(author, ["id"]) || this.readTextValue(message, ["authorId", "author_id"]);
+    }
+
+    getLiveMessageAuthorLine(message) {
+        const author = this.readObjectValue(message, ["author"]) || {};
+        const username = this.readTextValue(author, ["username", "name", "tag"]);
+        const globalName = this.readTextValue(author, ["globalName", "global_name", "displayName", "nick"]);
+        const authorId = this.getLiveMessageAuthorId(message);
+        if (globalName && username && globalName !== username) return `${globalName} (@${username})${authorId ? ` (<@${authorId}>)` : ""}`;
+        if (username) return `${username}${authorId ? ` (<@${authorId}>)` : ""}`;
+        return authorId ? `<@${authorId}>` : "Unknown author";
+    }
+
+    recordRobloxShareAuthorAudit(diagnostics, message, timestamp, inspection, match) {
+        const auditIds = ROBLOX_SHARE_SCAN.AUDIT_AUTHOR_IDS || [];
+        if (!auditIds.length || !diagnostics?.authorAudit) return;
+        const text = this.flattenDiscordMessage(message);
+        const haystack = `${inspection?.authorValues || ""}\n${text}`;
+        const matchedIds = auditIds.filter(id => haystack.includes(id));
+        if (!matchedIds.length) return;
+        const messageValues = this.getLogFieldValues(message, "Message", text);
+        const shareMessage = this.getShareMessageValue(messageValues, text);
+        diagnostics.authorAudit.push({
+            auditIds: matchedIds.join(" "),
+            logMessageId: message?.id || "",
+            timestamp: new Date(timestamp).toISOString(),
+            counted: match ? "yes" : "no",
+            reason: match
+                ? "counted"
+                : !inspection?.hasEggChannel
+                    ? "not egg-chat"
+                    : !shareMessage
+                        ? "no supported share link found"
+                        : "filtered",
+            hasEggChannel: Boolean(inspection?.hasEggChannel),
+            hasShareAnywhere: Boolean(inspection?.hasShareAnywhere),
+            hasMessageFieldShare: Boolean(inspection?.hasMessageFieldShare),
+            authorValues: inspection?.authorValues || "",
+            channelValues: inspection?.channelValues || "",
+            messageValues: inspection?.messageValues || "",
+            extractedShareMessage: shareMessage || "",
+            preview: text.slice(0, 900)
+        });
+    }
+
+    flattenDiscordMessage(message) {
+        const parts = [this.readTextValue(message, ["content", "cleanContent"])];
+        for (const embed of this.toSimpleArray(this.readObjectValue(message, ["embeds"]))) {
+            parts.push(
+                this.readTextValue(embed, ["title", "rawTitle"]),
+                this.readTextValue(embed, ["description", "rawDescription"]),
+                this.readTextValue(embed, ["url", "rawUrl"]),
+                this.readTextValue(this.readObjectValue(embed, ["footer", "rawFooter"]), ["text", "rawText"]),
+                this.readTextValue(this.readObjectValue(embed, ["author", "rawAuthor"]), ["name", "rawName"])
+            );
+
+            for (const field of this.toSimpleArray(this.readObjectValue(embed, ["fields", "rawFields", "_fields"]))) {
+                const name = this.readTextValue(field, ["name", "rawName"]);
+                const value = this.readTextValue(field, ["value", "rawValue"]);
+                if (name || value) parts.push(`${name}: ${value}`);
+            }
+        }
+        return cleanLogText(parts.filter(Boolean).join("\n"));
+    }
+
+    getLogFieldValues(message, label, flattenedText = "") {
+        const values = [];
+        const wanted = this.normalizeLogLabel(label);
+
+        for (const embed of this.toSimpleArray(this.readObjectValue(message, ["embeds"]))) {
+            for (const field of this.toSimpleArray(this.readObjectValue(embed, ["fields", "rawFields", "_fields"]))) {
+                const fieldName = this.readTextValue(field, ["name", "rawName"]);
+                const fieldValue = this.readTextValue(field, ["value", "rawValue"]);
+                if (this.normalizeLogLabel(fieldName) === wanted && fieldValue) values.push(cleanLogText(fieldValue).trim());
+            }
+        }
+
+        const plainText = cleanLogText(flattenedText)
+            .replace(/```/g, "")
+            .replace(/\*\*/g, "")
+            .replace(/`/g, "");
+        const escapedLabel = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const lineRegex = new RegExp(`^\\s*(?:[>\\-•]\\s*)?${escapedLabel}\\s*[:：]\\s*(.*)$`, "i");
+        const lines = plainText.split("\n");
+
+        for (let index = 0; index < lines.length; index += 1) {
+            const match = lines[index].match(lineRegex);
+            if (!match) continue;
+
+            const block = [match[1].trim()].filter(Boolean);
+            for (let next = index + 1; next < lines.length; next += 1) {
+                const line = lines[next].trim();
+                if (this.looksLikeLogLabelLine(line)) break;
+                if (line) block.push(line);
+            }
+            values.push(block.join("\n").trim());
+        }
+
+        return Array.from(new Set(values.filter(Boolean)));
+    }
+
+    readObjectValue(source, keys) {
+        if (!source) return undefined;
+        const candidates = [source];
+
+        try {
+            if (typeof source.toJS === "function") candidates.push(source.toJS());
+        }
+        catch (_) {}
+
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+            for (const key of keys) {
+                try {
+                    const value = candidate[key];
+                    if (value !== undefined && typeof value !== "function") return value;
+                }
+                catch (_) {}
+                try {
+                    if (typeof candidate.get === "function") {
+                        const value = candidate.get(key);
+                        if (value !== undefined && typeof value !== "function") return value;
+                    }
+                }
+                catch (_) {}
+            }
+        }
+        return undefined;
+    }
+
+    readTextValue(source, keys) {
+        const value = this.readObjectValue(source, keys);
+        if (value === undefined || value === null) return "";
+        if (typeof value === "string") return value;
+        if (typeof value === "number" || typeof value === "boolean") return String(value);
+        if (typeof value.toString === "function" && value.toString !== Object.prototype.toString) {
+            try {
+                const text = value.toString();
+                return text === "[object Object]" ? "" : text;
+            }
+            catch (_) {}
+        }
+        return "";
+    }
+
+    toSimpleArray(value) {
+        if (!value) return [];
+        if (Array.isArray(value)) return value;
+        if (value instanceof Map || value instanceof Set) return Array.from(value.values());
+        try {
+            if (typeof value.toArray === "function") return value.toArray();
+        }
+        catch (_) {}
+        try {
+            if (typeof value.toJS === "function") {
+                const raw = value.toJS();
+                if (Array.isArray(raw)) return raw;
+                if (raw && typeof raw === "object") return Object.values(raw);
+            }
+        }
+        catch (_) {}
+        if (typeof value === "object") return Object.values(value);
+        return [];
+    }
+
+    getFirstLogFieldValue(message, labels, flattenedText = "") {
+        for (const label of labels) {
+            const value = this.getLogFieldValues(message, label, flattenedText)[0];
+            if (value) return value;
+        }
+        return "";
+    }
+
+    looksLikeLogLabelLine(line) {
+        const text = String(line || "").trim();
+        if (/^https?:\/\//i.test(text)) return false;
+        return /^(?:[>\-•]\s*)?[A-Za-z][A-Za-z0-9 _-]{1,44}\s*[:：]/.test(text);
+    }
+
+    hasEggChatReference(text, channelValues = []) {
+        const haystacks = [text].concat(channelValues).map(value => cleanLogText(value).toLowerCase());
+        return haystacks.some(value => {
+            const normalized = normalize(value);
+            return value.includes(ROBLOX_SHARE_SCAN.EGG_CHAT_CHANNEL_ID)
+                || normalized.includes("egg chat")
+                || normalized.includes("eggchat");
+        });
+    }
+
+    getShareMessageValue(messageValues, flattenedText) {
+        const fieldMatch = messageValues.find(value => this.hasSupportedRobloxShareLink(value));
+        if (fieldMatch) return fieldMatch;
+
+        const text = cleanLogText(flattenedText);
+        const messageBlock = this.getMessageBlockFromText(text);
+        if (this.hasSupportedRobloxShareLink(messageBlock)) return messageBlock;
+
+        const shareLine = text.split("\n").find(line => this.hasSupportedRobloxShareLink(line));
+        return shareLine?.trim() || "";
+    }
+
+    hasSupportedRobloxShareLink(value) {
+        const text = cleanLogText(value);
+        if (!text) return false;
+        return (ROBLOX_SHARE_SCAN.SHARE_PATTERNS || []).some(pattern => {
+            pattern.lastIndex = 0;
+            return pattern.test(text);
+        });
+    }
+
+    getMessageBlockFromText(text) {
+        const lines = cleanLogText(text).replace(/\*\*/g, "").replace(/`/g, "").split("\n");
+        for (let index = 0; index < lines.length; index += 1) {
+            const match = lines[index].match(/^\s*(?:[>\-•]\s*)?Message\s*[:：]\s*(.*)$/i);
+            if (!match) continue;
+            const block = [match[1].trim()].filter(Boolean);
+            for (let next = index + 1; next < lines.length; next += 1) {
+                const line = lines[next].trim();
+                if (this.looksLikeLogLabelLine(line)) break;
+                if (line) block.push(line);
+            }
+            return block.join("\n").trim();
+        }
+        return "";
+    }
+
+    extractMentionPair(text) {
+        const clean = cleanLogText(text);
+        return clean.match(/@[\w.-]{2,40}\s*\(@?[\w.-]{2,40}\)/)?.[0]
+            || clean.match(/<@!?\d{14,24}>/)?.[0]
+            || "";
+    }
+
+    normalizeLogLabel(value) {
+        return cleanLogText(value)
+            .replace(/[>*_`~|]/g, "")
+            .replace(/[:：]/g, "")
+            .trim()
+            .toLowerCase();
+    }
+
+    normalizeShareAuthorKey(authorLine) {
+        const text = String(authorLine || "").trim();
+        const parenthetical = text.match(/\((@?[^()]+)\)/);
+        const key = parenthetical?.[1] || text;
+        return key.replace(/^@/, "").replace(/\s+/g, " ").trim().toLowerCase() || "unknown";
+    }
+
+    summarizeShareScanMatches(matches, liveMatches = []) {
+        const byAuthor = new Map();
+        const getRow = match => {
+            const existing = byAuthor.get(match.authorKey) || {
+                authorKey: match.authorKey,
+                author: match.author,
+                count: 0,
+                eggChatLiveCount: 0,
+                totalCount: 0,
+                liveActiveMs: 0,
+                liveActiveTime: "",
+                logMessageIds: [],
+                eggChatLiveMessageIds: [],
+                firstTimestamp: match.timestamp,
+                lastTimestamp: match.timestamp
+            };
+            if (!existing.author || existing.author === "Unknown author") existing.author = match.author;
+            if (match.timestamp < existing.firstTimestamp) existing.firstTimestamp = match.timestamp;
+            if (match.timestamp > existing.lastTimestamp) existing.lastTimestamp = match.timestamp;
+            byAuthor.set(match.authorKey, existing);
+            return existing;
+        };
+
+        for (const match of matches) {
+            const existing = getRow(match);
+            existing.count += 1;
+            existing.logMessageIds.push(match.logMessageId);
+        }
+
+        for (const match of liveMatches) {
+            const existing = getRow(match);
+            existing.eggChatLiveCount += 1;
+            existing.eggChatLiveMessageIds.push(match.liveMessageId);
+            existing.liveActiveMs += Number(match.activeMs) || 0;
+        }
+
+        for (const row of byAuthor.values()) {
+            row.totalCount = row.count + row.eggChatLiveCount;
+            row.liveActiveTime = formatDuration(row.liveActiveMs);
+        }
+
+        return Array.from(byAuthor.values())
+            .sort((a, b) => b.totalCount - a.totalCount || b.count - a.count || a.author.localeCompare(b.author));
+    }
+
+    exportShareScanResult(result) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const summaryCsv = this.makeCsv(result.summary, [
+            ["rank", (_, index) => index + 1],
+            ["author", row => row.author],
+            ["author_key", row => row.authorKey],
+            ["count", row => row.count],
+            ["egg_chat_live_count", row => row.eggChatLiveCount || 0],
+            ["egg_chat_live_time", row => row.liveActiveTime || ""],
+            ["egg_chat_live_time_ms", row => row.liveActiveMs || 0],
+            ["total_count", row => row.totalCount || row.count],
+            ["first_timestamp", row => row.firstTimestamp],
+            ["last_timestamp", row => row.lastTimestamp],
+            ["log_message_ids", row => row.logMessageIds.join(" ")],
+            ["egg_chat_live_message_ids", row => (row.eggChatLiveMessageIds || []).join(" ")]
+        ]);
+        const evidenceRows = (result.matches || []).map(row => Object.assign({source: "server-log"}, row))
+            .concat((result.liveMatches || []).map(row => Object.assign({source: "egg-chat-live"}, row)));
+        const evidenceCsv = this.makeCsv(evidenceRows, [
+            ["source", row => row.source],
+            ["author", row => row.author],
+            ["author_key", row => row.authorKey],
+            ["timestamp", row => row.timestamp],
+            ["active_time", row => row.activeDuration || ""],
+            ["active_time_ms", row => row.activeMs || ""],
+            ["log_message_id", row => row.logMessageId],
+            ["egg_chat_message_id", row => row.liveMessageId],
+            ["message_url", row => row.messageUrl],
+            ["message", row => row.message]
+        ]);
+
+        this.downloadTextFile(`roblox-share-summary-${stamp}.csv`, summaryCsv, "text/csv;charset=utf-8");
+        this.downloadTextFile(`roblox-share-evidence-${stamp}.csv`, evidenceCsv, "text/csv;charset=utf-8");
+        const statusRows = (result.diagnostics?.fetches || []).map(row => Object.assign({source: "server-log", channelId: result.serverLogsChannelId}, row))
+            .concat((result.diagnostics?.liveFetches || []).map(row => Object.assign({source: "egg-chat-live", channelId: result.sourceChannelId}, row)));
+        const statusCsv = this.makeCsv(statusRows, [
+            ["source", row => row.source],
+            ["channel_id", row => row.channelId],
+            ["page", row => row.page],
+            ["message_count", row => row.messageCount],
+            ["response_type", row => row.responseType],
+            ["before", row => row.before],
+            ["first_timestamp", row => row.firstTimestamp],
+            ["last_timestamp", row => row.lastTimestamp],
+            ["first_message_id", row => row.firstMessageId],
+            ["last_message_id", row => row.lastMessageId],
+            ["attempts", row => (row.attempts || []).map(attempt => `${attempt.method}:${attempt.status || attempt.dataType || "unknown"}:${attempt.dataSize || ""}:${attempt.dataKeys || attempt.responseKeys || ""}:${attempt.message || attempt.error || attempt.preview || ""}`).join(" | ")],
+            ["endpoint", row => row.endpoint]
+        ]);
+        this.downloadTextFile(`roblox-share-status-${stamp}.csv`, statusCsv, "text/csv;charset=utf-8");
+        if (result.diagnostics?.authorAudit?.length) {
+            const auditCsv = this.makeCsv(result.diagnostics.authorAudit, [
+                ["audit_ids", row => row.auditIds],
+                ["log_message_id", row => row.logMessageId],
+                ["timestamp", row => row.timestamp],
+                ["counted", row => row.counted],
+                ["reason", row => row.reason],
+                ["has_egg_channel", row => row.hasEggChannel],
+                ["has_share_anywhere", row => row.hasShareAnywhere],
+                ["has_message_field_share", row => row.hasMessageFieldShare],
+                ["author_values", row => row.authorValues],
+                ["channel_values", row => row.channelValues],
+                ["message_values", row => row.messageValues],
+                ["extracted_share_message", row => row.extractedShareMessage],
+                ["preview", row => row.preview]
+            ]);
+            this.downloadTextFile(`roblox-share-author-audit-${stamp}.csv`, auditCsv, "text/csv;charset=utf-8");
+        }
+        if (!result.totalMatches) {
+            const debugCsv = this.makeCsv(result.diagnostics?.samples || [], [
+                ["log_message_id", row => row.logMessageId],
+                ["timestamp", row => row.timestamp],
+                ["has_egg_channel", row => row.hasEggChannel],
+                ["has_share_anywhere", row => row.hasShareAnywhere],
+                ["has_message_field_share", row => row.hasMessageFieldShare],
+                ["channel_values", row => row.channelValues],
+                ["author_values", row => row.authorValues],
+                ["message_values", row => row.messageValues],
+                ["preview", row => row.preview]
+            ]);
+            this.downloadTextFile(`roblox-share-debug-${stamp}.csv`, debugCsv, "text/csv;charset=utf-8");
+        }
+    }
+
+    makeCsv(rows, columns) {
+        const header = columns.map(([name]) => this.csvEscape(name)).join(",");
+        const lines = rows.map((row, index) => columns
+            .map(([, getter]) => this.csvEscape(getter(row, index)))
+            .join(","));
+        return [header, ...lines].join("\n");
+    }
+
+    csvEscape(value) {
+        const text = value === undefined || value === null ? "" : String(value).replace(/\r?\n/g, " ");
+        if (!/[",\n]/.test(text)) return text;
+        return `"${text.replace(/"/g, '""')}"`;
+    }
+
+    downloadTextFile(filename, content, type) {
+        const blob = new Blob([content], {type});
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    formatShareScanSummary(result) {
+        const lines = [
+            "Roblox share scan",
+            `Window: ${new Date(result.start).toLocaleString()} to ${new Date(result.end).toLocaleString()}`,
+            `Matched posts: ${result.totalMatches}`,
+            `Server-log posts: ${result.serverLogMatches || 0}`,
+            `Live #egg-chat posts: ${result.liveEggChatMatches || 0}`,
+            `Messages scanned: ${result.scannedMessages}`,
+            `Live #egg-chat messages scanned: ${result.liveScannedMessages || 0}`,
+            `Pages scanned: ${result.pagesScanned}`,
+            `Live #egg-chat pages scanned: ${result.livePagesScanned || 0}`,
+            `Break reason: ${result.breakReason}`,
+            `Live break reason: ${result.liveBreakReason || ""}`,
+            `In-window messages: ${result.diagnostics?.inWindowMessages || 0}`,
+            `Share-link messages: ${result.diagnostics?.shareAnywhereMessages || 0}`,
+            `Egg-chat messages: ${result.diagnostics?.eggChannelMessages || 0}`,
+            `Live #egg-chat share messages: ${result.diagnostics?.liveEggShareMessages || 0}`,
+            ""
+        ];
+        result.summary.forEach((row, index) => {
+            lines.push(`${index + 1}. ${row.author} - total ${row.totalCount || row.count}, logs ${row.count}, live ${row.eggChatLiveCount || 0}, live time ${row.liveActiveTime || "0m"} (${row.logMessageIds.join(", ")})`);
+        });
+        if (result.cappedByMaxPages) lines.push("", "Scan stopped at the page limit before reaching the start time.");
+        return lines.join("\n");
     }
 
     extractThreads(data, guildId, parentId = "") {
