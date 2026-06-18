@@ -2,7 +2,7 @@
  * @name RobloxShareLeaderboard
  * @author ChatGPT
  * @description Webhook-only Roblox private-server leaderboard scanner for C0LD egg-chat. No CSV/XLSX exports.
- * @version 0.1.3
+ * @version 0.2.1
  */
 
 const PLUGIN_NAME = "RobloxShareLeaderboard";
@@ -13,7 +13,7 @@ const DISCORD_EPOCH = 1420070400000n;
 const DEFAULT_SETTINGS = {
     webhookUrl: "",
     webhookMessageId: "",
-    threadId: "1504955979597349166",
+    threadId: "",
     serverLogsChannelId: "1489879731569426485",
     eggChatChannelId: "1515759898565148884",
     sapphireBotUserId: "1489881332241666139",
@@ -40,25 +40,12 @@ function clean(value) {
         .replace(/\u00a0/g, " ")
         .replace(/\r\n?/g, "\n");
 }
-
-function normalize(value) {
-    return clean(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function wait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function snowflakeToTimestamp(id) {
-    try { return id ? Number((BigInt(String(id)) >> 22n) + DISCORD_EPOCH) : 0; }
-    catch (_) { return 0; }
-}
-
-function timestampToSnowflake(ms) {
-    try { return String((BigInt(Math.max(0, Number(ms) || 0)) - DISCORD_EPOCH) << 22n); }
-    catch (_) { return ""; }
-}
-
+function normalize(value) { return clean(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); }
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function copySettings(settings) { return Object.assign({}, DEFAULT_SETTINGS, settings || {}); }
+function createElement(tag, className, text) { const element = document.createElement(tag); if (className) element.className = className; if (text !== undefined && text !== null) element.textContent = String(text); return element; }
+function snowflakeToTimestamp(id) { try { return id ? Number((BigInt(String(id)) >> 22n) + DISCORD_EPOCH) : 0; } catch (_) { return 0; } }
+function timestampToSnowflake(ms) { try { return String((BigInt(Math.max(0, Number(ms) || 0)) - DISCORD_EPOCH) << 22n); } catch (_) { return ""; } }
 function timestampFromMessage(message) {
     const timestamp = message?.timestamp || message?.editedTimestamp || message?.edited_timestamp;
     if (timestamp instanceof Date) return timestamp.getTime();
@@ -66,7 +53,6 @@ function timestampFromMessage(message) {
     const parsed = timestamp ? Date.parse(String(timestamp)) : NaN;
     return Number.isFinite(parsed) ? parsed : snowflakeToTimestamp(message?.id);
 }
-
 function formatDuration(ms) {
     const minutes = Math.max(0, Math.floor((Number(ms) || 0) / 60000));
     const days = Math.floor(minutes / 1440);
@@ -78,733 +64,155 @@ function formatDuration(ms) {
     if (mins || !parts.length) parts.push(`${mins}m`);
     return parts.join(" ");
 }
-
-function copySettings(settings) {
-    return Object.assign({}, DEFAULT_SETTINGS, settings || {});
+function toMessageArray(value, output = [], seen = new Set(), depth = 0) {
+    if (!value || output.length > 2000 || depth > 6) return output;
+    if (Array.isArray(value)) { for (const item of value) toMessageArray(item, output, seen, depth + 1); return output; }
+    if (value instanceof Map || value instanceof Set) { value.forEach(item => toMessageArray(item, output, seen, depth + 1)); return output; }
+    if (typeof value !== "object" || seen.has(value)) return output;
+    seen.add(value);
+    try { if (typeof value.toArray === "function") toMessageArray(value.toArray(), output, seen, depth + 1); } catch (_) {}
+    try { if (typeof value.toJS === "function") toMessageArray(value.toJS(), output, seen, depth + 1); } catch (_) {}
+    if (value.id && (value.content !== undefined || value.embeds !== undefined || value.timestamp !== undefined)) { output.push(value); return output; }
+    for (const key of ["body", "data", "messages", "items", "results", "records", "_array", "array", "_map", "map", "cache"]) {
+        if (value[key]) toMessageArray(value[key], output, seen, depth + 1);
+    }
+    return output;
 }
-
-function createElement(tag, className, text) {
-    const element = document.createElement(tag);
-    if (className) element.className = className;
-    if (text !== undefined && text !== null) element.textContent = String(text);
-    return element;
+function collectSnowflakeIds(value, output = new Set(), seen = new Set(), depth = 0) {
+    if (!value || output.size > 2000 || depth > 6) return output;
+    if (typeof value === "string") { if (/^\d{14,24}$/.test(value)) output.add(value); return output; }
+    if (Array.isArray(value)) { value.forEach(item => collectSnowflakeIds(item, output, seen, depth + 1)); return output; }
+    if (value instanceof Map || value instanceof Set) { value.forEach(item => collectSnowflakeIds(item, output, seen, depth + 1)); return output; }
+    if (typeof value !== "object" || seen.has(value)) return output;
+    seen.add(value);
+    try { if (typeof value.toArray === "function") collectSnowflakeIds(value.toArray(), output, seen, depth + 1); } catch (_) {}
+    try { if (typeof value.toJS === "function") collectSnowflakeIds(value.toJS(), output, seen, depth + 1); } catch (_) {}
+    for (const key of ["id", "messageId", "message_id"]) if (/^\d{14,24}$/.test(String(value[key] || ""))) output.add(String(value[key]));
+    for (const key of ["_array", "array", "messages", "items", "records", "_map", "map", "cache"]) if (value[key]) collectSnowflakeIds(value[key], output, seen, depth + 1);
+    return output;
 }
 
 module.exports = class RobloxShareLeaderboard {
-    constructor() {
-        this.settings = copySettings();
-        this.intervalTimer = null;
-        this.startupTimer = null;
-        this.running = false;
-        this.modules = {};
-    }
-
-    start() {
-        this.settings = copySettings(BdApi.Data.load(PLUGIN_NAME, SETTINGS_KEY));
-        this.resolveModules();
-        this.restartTimer();
-        BdApi.UI?.showToast?.(`${PLUGIN_NAME} loaded`, {type: "info"});
-    }
-
-    stop() {
-        this.stopTimer();
-    }
-
+    constructor() { this.settings = copySettings(); this.intervalTimer = null; this.startupTimer = null; this.running = false; this.modules = {}; }
+    start() { this.settings = copySettings(BdApi.Data.load(PLUGIN_NAME, SETTINGS_KEY)); this.resolveModules(); this.restartTimer(); BdApi.UI?.showToast?.(`${PLUGIN_NAME} loaded`, {type: "info"}); }
+    stop() { this.stopTimer(); }
     resolveModules() {
-        const webpack = BdApi?.Webpack;
-        const filters = webpack?.Filters;
-        const candidates = [];
-        const add = (label, value) => {
-            if (value && typeof value === "object" && !candidates.some(item => item.module === value)) candidates.push({label, module: value});
-        };
-        try { add("AuthenticationStore", webpack?.getStore?.("AuthenticationStore")); } catch (_) {}
-        try { add("getModule searchExports", webpack?.getModule?.(filters?.byKeys?.("getToken"), {searchExports: true})); } catch (_) {}
-        try { add("getModule", webpack?.getModule?.(filters?.byKeys?.("getToken"))); } catch (_) {}
-        try { add("getByKeys", webpack?.getByKeys?.("getToken")); } catch (_) {}
-        try { add("getByKeys user", webpack?.getByKeys?.("getToken", "getId")); } catch (_) {}
-        this.modules.authCandidates = candidates;
+        const wp = BdApi?.Webpack;
+        const byKeys = wp?.Filters?.byKeys;
+        this.modules.MessageActions = wp?.getModule?.(byKeys?.("fetchMessages", "sendMessage"), {searchExports: true})
+            || wp?.getModule?.(byKeys?.("fetchMessages"), {searchExports: true})
+            || wp?.getModule?.(byKeys?.("loadMessages"), {searchExports: true})
+            || wp?.getByKeys?.("fetchMessages", "sendMessage")
+            || wp?.getByKeys?.("fetchMessages")
+            || wp?.getByKeys?.("loadMessages")
+            || null;
+        this.modules.MessageStore = wp?.getStore?.("MessageStore")
+            || wp?.Stores?.MessageStore
+            || wp?.getByKeys?.("getMessages", "getMessage")
+            || wp?.getByKeys?.("getMessages")
+            || null;
     }
-
     getSettingsPanel() {
         const root = createElement("div");
         root.style.cssText = "display:flex;flex-direction:column;gap:10px;padding:12px;max-width:760px";
-        root.append(createElement("div", null, "Webhook-only scanner. Leave webhookMessageId blank the first time; after the first real scan post, copy that message ID into this setting if Discord does not return it automatically."));
-
-        const fields = [
-            ["webhookUrl", "Discord webhook URL", "password"],
-            ["webhookMessageId", "Initialized webhook message ID", "text"],
-            ["threadId", "Webhook thread ID", "text"],
-            ["serverLogsChannelId", "Server logs channel ID", "text"],
-            ["eggChatChannelId", "Egg chat channel ID", "text"],
-            ["sapphireBotUserId", "Sapphire bot user ID", "text"],
-            ["startLocal", "Event start", "datetime-local"],
-            ["endLocal", "Event end", "datetime-local"],
-            ["intervalMinutes", "Interval minutes", "number"],
-            ["maxPages", "Max pages", "number"],
-            ["logScanGraceDays", "Deleted-log grace days", "number"]
-        ];
-        for (const [key, label, type] of fields) root.append(this.createInput(key, label, type));
-
-        root.append(
-            this.createCheckbox("autoUpdate", "Auto-update webhook", () => this.restartTimer()),
-            this.createCheckbox("showDiagnostics", "Show scan diagnostics in webhook", () => this.saveSettings())
-        );
-
-        const buttons = createElement("div");
-        buttons.style.cssText = "display:flex;gap:8px;flex-wrap:wrap";
-        const test = createElement("button", null, "Test webhook only");
-        test.type = "button";
-        test.addEventListener("click", () => this.testWebhookOnly());
-        const run = createElement("button", null, "Run REAL scan + update webhook now");
-        run.type = "button";
-        run.addEventListener("click", () => this.runManual());
-        const auth = createElement("button", null, "Test Discord auth lookup");
-        auth.type = "button";
-        auth.addEventListener("click", () => this.testAuthLookup());
-        const forget = createElement("button", null, "Forget stored message ID");
-        forget.type = "button";
-        forget.addEventListener("click", () => {
-            BdApi.Data.save(PLUGIN_NAME, STATE_KEY, {});
-            this.settings.webhookMessageId = "";
-            this.saveSettings();
-            BdApi.UI?.showToast?.("Stored webhook message ID cleared", {type: "success"});
-        });
-        buttons.append(test, run, auth, forget);
-        root.append(buttons);
-        return root;
+        root.append(createElement("div", null, "Webhook-only scanner. The webhook can be in any server/channel. The real scan uses Discord's message loader/cache path, matching the older working OfficerMode scan method."));
+        const fields = [["webhookUrl","Discord webhook URL","password"],["webhookMessageId","Initialized webhook message ID","text"],["threadId","Webhook thread ID (blank unless posting into a thread)","text"],["serverLogsChannelId","Server logs channel ID","text"],["eggChatChannelId","Egg chat channel ID","text"],["sapphireBotUserId","Sapphire bot user ID","text"],["startLocal","Event start","datetime-local"],["endLocal","Event end","datetime-local"],["intervalMinutes","Interval minutes","number"],["maxPages","Max pages","number"],["logScanGraceDays","Deleted-log grace days","number"]];
+        for (const [key,label,type] of fields) root.append(this.createInput(key,label,type));
+        root.append(this.createCheckbox("autoUpdate", "Auto-update webhook", () => this.restartTimer()), this.createCheckbox("showDiagnostics", "Show scan diagnostics in webhook", () => this.saveSettings()));
+        const buttons = createElement("div"); buttons.style.cssText = "display:flex;gap:8px;flex-wrap:wrap";
+        const test = createElement("button", null, "Test webhook only"); test.type = "button"; test.addEventListener("click", () => this.testWebhookOnly());
+        const run = createElement("button", null, "Run REAL scan + update webhook now"); run.type = "button"; run.addEventListener("click", () => this.runManual());
+        const api = createElement("button", null, "Test scan loader"); api.type = "button"; api.addEventListener("click", () => this.testScanLoader());
+        const forget = createElement("button", null, "Forget stored message ID"); forget.type = "button"; forget.addEventListener("click", () => { BdApi.Data.save(PLUGIN_NAME, STATE_KEY, {}); this.settings.webhookMessageId = ""; this.saveSettings(); BdApi.UI?.showToast?.("Stored webhook message ID cleared", {type:"success"}); });
+        buttons.append(test, run, api, forget); root.append(buttons); return root;
     }
-
-    createCheckbox(key, label, afterChange) {
-        const wrap = createElement("label");
-        wrap.style.cssText = "display:flex;gap:8px;align-items:center";
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = Boolean(this.settings[key]);
-        checkbox.addEventListener("change", () => {
-            this.settings[key] = checkbox.checked;
-            this.saveSettings();
-            afterChange?.();
-        });
-        wrap.append(checkbox, createElement("span", null, label));
-        return wrap;
-    }
-
-    createInput(key, label, type) {
-        const wrap = createElement("label");
-        wrap.style.cssText = "display:grid;gap:4px";
-        const input = document.createElement("input");
-        input.type = type;
-        input.value = this.settings[key] ?? "";
-        input.style.cssText = "padding:8px;border-radius:6px;border:1px solid var(--background-modifier-accent);background:var(--input-background);color:var(--text-normal)";
-        input.addEventListener("change", () => {
-            const numeric = ["intervalMinutes", "maxPages", "logScanGraceDays"].includes(key);
-            this.settings[key] = numeric ? Math.max(1, Number(input.value) || DEFAULT_SETTINGS[key]) : input.value.trim();
-            input.value = String(this.settings[key]);
-            this.saveSettings();
-            this.restartTimer();
-        });
-        wrap.append(createElement("b", null, label), input);
-        return wrap;
-    }
-
-    saveSettings() {
-        BdApi.Data.save(PLUGIN_NAME, SETTINGS_KEY, this.settings);
-    }
-
-    stopTimer() {
-        clearInterval(this.intervalTimer);
-        clearTimeout(this.startupTimer);
-        this.intervalTimer = null;
-        this.startupTimer = null;
-    }
-
-    restartTimer() {
-        this.stopTimer();
-        if (!this.settings.autoUpdate) return;
-        this.startupTimer = setTimeout(() => this.runScheduled("startup"), 30000);
-        this.intervalTimer = setInterval(() => this.runScheduled("interval"), Math.max(1, Number(this.settings.intervalMinutes) || 15) * 60000);
-    }
-
-    testAuthLookup() {
-        this.resolveModules();
-        const found = this.getToken();
-        const labels = (this.modules.authCandidates || []).map(candidate => candidate.label).join(", ") || "none";
-        const message = found ? `Discord auth lookup OK via: ${labels}` : `Discord auth lookup FAILED. Candidates found: ${labels}`;
-        console.log(`${PLUGIN_NAME} auth test`, {ok: Boolean(found), candidates: this.modules.authCandidates?.map(candidate => candidate.label)});
-        BdApi.UI?.showToast?.(message, {type: found ? "success" : "error", timeout: 8000});
-    }
-
-    async testWebhookOnly() {
-        try {
-            BdApi.UI?.showToast?.("Sending webhook-only test...", {type: "info"});
-            const payload = {content: `**${PLUGIN_NAME} webhook-only test**\nThis does not scan Discord history and does not update the saved leaderboard message ID.`, allowed_mentions: {parse: []}};
-            await this.webhookRequest(this.getWebhookCreateUrl(), "POST", payload);
-            BdApi.UI?.showToast?.("Webhook-only test sent", {type: "success"});
-        }
-        catch (error) {
-            console.error(error);
-            BdApi.UI?.showToast?.(`Webhook test failed: ${error?.message || error}`, {type: "error", timeout: 8000});
-        }
-    }
-
-    async runManual() {
-        try {
-            BdApi.UI?.showToast?.("Running REAL scan now...", {type: "info"});
-            const result = await this.runScheduled("manual");
-            if (result) {
-                BdApi.UI?.showToast?.(`Real scan updated: ${result.totalMatches} posts, ${result.summary.length} members`, {type: "success"});
-                console.log(`${PLUGIN_NAME} real scan result`, result);
-            }
-        }
-        catch (error) {
-            console.error(error);
-            BdApi.UI?.showToast?.(`Real scan failed: ${error?.message || error}`, {type: "error", timeout: 8000});
-        }
-    }
-
-    async runScheduled(reason) {
-        if (this.running) return null;
-        this.running = true;
-        try {
-            const result = await this.scan();
-            BdApi.Data.save(PLUGIN_NAME, "lastScan", result);
-            await this.updateWebhook(result);
-            return result;
-        }
-        catch (error) {
-            this.saveState(Object.assign({}, this.loadState(), {lastError: error?.message || String(error), lastErrorAt: new Date().toISOString(), reason}));
-            if (reason === "manual") throw error;
-            console.error(`${PLUGIN_NAME} update failed`, error);
-            return null;
-        }
-        finally {
-            this.running = false;
-        }
-    }
-
-    getWindow() {
-        const startMs = Date.parse(this.settings.startLocal);
-        const endMs = Date.parse(this.settings.endLocal);
-        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) throw new Error("Invalid event date window");
-        return {startMs, endMs};
-    }
-
+    createCheckbox(key,label,afterChange) { const wrap = createElement("label"); wrap.style.cssText = "display:flex;gap:8px;align-items:center"; const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = Boolean(this.settings[key]); cb.addEventListener("change", () => { this.settings[key] = cb.checked; this.saveSettings(); afterChange?.(); }); wrap.append(cb, createElement("span", null, label)); return wrap; }
+    createInput(key,label,type) { const wrap = createElement("label"); wrap.style.cssText = "display:grid;gap:4px"; const input = document.createElement("input"); input.type = type; input.value = this.settings[key] ?? ""; input.style.cssText = "padding:8px;border-radius:6px;border:1px solid var(--background-modifier-accent);background:var(--input-background);color:var(--text-normal)"; input.addEventListener("change", () => { const numeric = ["intervalMinutes","maxPages","logScanGraceDays"].includes(key); this.settings[key] = numeric ? Math.max(1, Number(input.value) || DEFAULT_SETTINGS[key]) : input.value.trim(); input.value = String(this.settings[key]); this.saveSettings(); this.restartTimer(); }); wrap.append(createElement("b", null, label), input); return wrap; }
+    saveSettings() { BdApi.Data.save(PLUGIN_NAME, SETTINGS_KEY, this.settings); }
+    stopTimer() { clearInterval(this.intervalTimer); clearTimeout(this.startupTimer); this.intervalTimer = null; this.startupTimer = null; }
+    restartTimer() { this.stopTimer(); if (!this.settings.autoUpdate) return; this.startupTimer = setTimeout(() => this.runScheduled("startup"), 30000); this.intervalTimer = setInterval(() => this.runScheduled("interval"), Math.max(1, Number(this.settings.intervalMinutes) || 15) * 60000); }
+    testScanLoader() { this.resolveModules(); const ok = Boolean(this.modules.MessageActions && this.modules.MessageStore); BdApi.UI?.showToast?.(ok ? "Scan loader OK: message actions and message store found" : `Scan loader missing: actions=${Boolean(this.modules.MessageActions)} store=${Boolean(this.modules.MessageStore)}`, {type: ok ? "success" : "error", timeout: 8000}); }
+    async testWebhookOnly() { try { BdApi.UI?.showToast?.("Sending webhook-only test...", {type:"info"}); await this.webhookRequest(this.getWebhookCreateUrl(), "POST", {content:`**${PLUGIN_NAME} webhook-only test**\nThis does not scan Discord history.`, allowed_mentions:{parse:[]}}); BdApi.UI?.showToast?.("Webhook-only test sent", {type:"success"}); } catch(error) { console.error(error); BdApi.UI?.showToast?.(`Webhook test failed: ${error?.message || error}`, {type:"error", timeout:8000}); } }
+    async runManual() { try { BdApi.UI?.showToast?.("Running REAL scan now...", {type:"info"}); const result = await this.runScheduled("manual"); if (result) BdApi.UI?.showToast?.(`Real scan updated: ${result.totalMatches} posts, ${result.summary.length} members`, {type:"success"}); } catch(error) { console.error(error); BdApi.UI?.showToast?.(`Real scan failed: ${error?.message || error}`, {type:"error", timeout:10000}); } }
+    async runScheduled(reason) { if (this.running) return null; this.running = true; try { const result = await this.scan(); BdApi.Data.save(PLUGIN_NAME, "lastScan", result); await this.updateWebhook(result); return result; } catch(error) { this.saveState(Object.assign({}, this.loadState(), {lastError:error?.message || String(error), lastErrorAt:new Date().toISOString(), reason})); if (reason === "manual") throw error; console.error(`${PLUGIN_NAME} update failed`, error); return null; } finally { this.running = false; } }
+    getWindow() { const startMs = Date.parse(this.settings.startLocal), endMs = Date.parse(this.settings.endLocal); if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) throw new Error("Invalid event date window"); return {startMs, endMs}; }
     async scan() {
         const {startMs, endMs} = this.getWindow();
-        const now = Date.now();
-        const activeUntil = Math.min(now, endMs);
-        const logEnd = Math.min(now, endMs + Math.max(0, Number(this.settings.logScanGraceDays) || 0) * 86400000);
-        const diagnostics = {
-            livePages: 0,
-            liveMessages: 0,
-            liveMatches: 0,
-            logPages: 0,
-            logMessages: 0,
-            logMatches: 0,
-            rejected: {},
-            dedupedAway: 0,
-            samples: []
-        };
-
+        const now = Date.now(), activeUntil = Math.min(now, endMs), logEnd = Math.min(now, endMs + Math.max(0, Number(this.settings.logScanGraceDays) || 0) * 86400000);
+        const diagnostics = {livePages:0, liveMessages:0, liveMatches:0, logPages:0, logMessages:0, logMatches:0, rejected:{}, dedupedAway:0, actionAttempts:[], samples:[]};
         const liveMatches = await this.scanLive(startMs, activeUntil, diagnostics);
         const deletedMatches = await this.scanLogs(startMs, logEnd, diagnostics);
         const evidenceMatches = this.dedupeEvidence(deletedMatches, liveMatches, diagnostics);
         const summary = this.summarize(evidenceMatches);
-
-        return {generatedAt: new Date().toISOString(), start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), serverLogsChannelId: this.settings.serverLogsChannelId, sourceChannelId: this.settings.eggChatChannelId, totalMatches: evidenceMatches.length, summary, diagnostics, evidenceMatches, deletedMatches, liveMatches};
+        return {generatedAt:new Date().toISOString(), start:new Date(startMs).toISOString(), end:new Date(endMs).toISOString(), serverLogsChannelId:this.settings.serverLogsChannelId, sourceChannelId:this.settings.eggChatChannelId, totalMatches:evidenceMatches.length, summary, diagnostics, evidenceMatches, deletedMatches, liveMatches};
     }
-
-    async scanLive(startMs, endMs, diagnostics) {
-        const matches = [];
-        let before = timestampToSnowflake(endMs + 1);
-        let reachedStart = false;
-        for (let page = 0; page < Number(this.settings.maxPages) && !reachedStart; page += 1) {
-            const messages = await this.fetchMessagePage(this.settings.eggChatChannelId, before);
-            diagnostics.livePages += 1;
-            diagnostics.liveMessages += messages.length;
-            if (!messages.length) break;
-            for (const message of messages) {
-                const timestamp = timestampFromMessage(message);
-                if (timestamp && timestamp < startMs) { reachedStart = true; continue; }
-                if (!timestamp || timestamp > endMs || timestamp < startMs) continue;
-                const match = this.getLiveMatch(message, timestamp, endMs);
-                if (match) { matches.push(match); diagnostics.liveMatches += 1; }
-            }
-            before = messages[messages.length - 1]?.id || "";
-            if (!before) break;
-            if (!reachedStart) await wait(175);
-        }
-        return matches;
-    }
-
-    async scanLogs(startMs, endMs, diagnostics) {
-        const matches = [];
-        let before = timestampToSnowflake(endMs + 1);
-        let reachedStart = false;
-        for (let page = 0; page < Number(this.settings.maxPages) && !reachedStart; page += 1) {
-            const messages = await this.fetchMessagePage(this.settings.serverLogsChannelId, before);
-            diagnostics.logPages += 1;
-            diagnostics.logMessages += messages.length;
-            if (!messages.length) break;
-            for (const message of messages) {
-                const timestamp = timestampFromMessage(message);
-                if (timestamp && timestamp < startMs) { reachedStart = true; continue; }
-                if (!timestamp || timestamp > endMs || timestamp < startMs) continue;
-                const match = this.getDeletedLogMatch(message, timestamp, startMs, diagnostics);
-                if (match) { matches.push(match); diagnostics.logMatches += 1; }
-            }
-            before = messages[messages.length - 1]?.id || "";
-            if (!before) break;
-            if (!reachedStart) await wait(175);
-        }
-        return matches;
-    }
-
-    reject(diagnostics, reason, message = null) {
-        diagnostics.rejected[reason] = (diagnostics.rejected[reason] || 0) + 1;
-        if (message && diagnostics.samples.length < 6) diagnostics.samples.push({reason, snippet: this.flattenMessage(message).slice(0, 260)});
-    }
-
-    getDeletedLogMatch(message, logTimestamp, startMs, diagnostics) {
-        const text = this.flattenMessage(message);
-        if (this.getMessageAuthorId(message) !== String(this.settings.sapphireBotUserId)) { this.reject(diagnostics, "not_sapphire"); return null; }
-        if (!/message\s+deleted/i.test(text)) { this.reject(diagnostics, "not_deleted_log"); return null; }
-        const channelValues = this.getLogFieldValues(message, "Channel", text);
-        if (!this.hasEggChatReference(text, channelValues)) { this.reject(diagnostics, "not_egg_chat", message); return null; }
-
-        const messageValues = this.getLogFieldValues(message, "Message", text);
-        const shareMessage = this.getShareMessageValue(messageValues, text);
-        if (!shareMessage) { this.reject(diagnostics, "no_link_in_message_block", message); return null; }
-
-        const sourceMessageId = this.extractSourceMessageId(message, text);
-        const sourceTimestamp = sourceMessageId ? snowflakeToTimestamp(sourceMessageId) : logTimestamp;
-        const endTimestamp = Date.parse(this.settings.endLocal);
-        if (!sourceTimestamp || sourceTimestamp < startMs || sourceTimestamp > endTimestamp) { this.reject(diagnostics, "source_outside_window", message); return null; }
-
-        const author = this.getFirstLogFieldValue(message, ["Message author", "Message Author", "Author", "User"], text) || this.extractMentionPair(text) || "Unknown author";
-        const guildId = this.getGuildId() || "@me";
-        return {source: "server-log", author, authorKey: this.normalizeAuthorKey(author), sourceMessageId, canonicalLink: this.extractCanonicalLink(shareMessage), logMessageId: message.id, timestamp: new Date(sourceTimestamp).toISOString(), deletedLogTimestamp: new Date(logTimestamp).toISOString(), messageUrl: `https://discord.com/channels/${guildId}/${this.settings.serverLogsChannelId}/${message.id}`, message: shareMessage};
-    }
-
-    getLiveMatch(message, timestamp, activeUntil) {
-        const text = this.flattenMessage(message);
-        const shareMessage = this.getShareMessageValue([], text);
-        if (!shareMessage) return null;
-        const author = this.getLiveAuthorContext(message);
-        const guildId = this.getGuildId() || "@me";
-        const activeMs = Math.max(0, activeUntil - timestamp);
-        return {source: "egg-chat-live", author: author.line || "Unknown author", authorKey: author.key || this.normalizeAuthorKey(author.line), sourceMessageId: message.id, canonicalLink: this.extractCanonicalLink(shareMessage), liveMessageId: message.id, timestamp: new Date(timestamp).toISOString(), activeMs, activeDuration: formatDuration(activeMs), messageUrl: `https://discord.com/channels/${guildId}/${this.settings.eggChatChannelId}/${message.id}`, message: shareMessage};
-    }
-
-    dedupeEvidence(deletedMatches, liveMatches, diagnostics) {
-        const byKey = new Map();
-        for (const match of liveMatches) byKey.set(this.getEvidenceKey(match), match);
-        for (const match of deletedMatches) byKey.set(this.getEvidenceKey(match), match);
-        const evidence = Array.from(byKey.values()).sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
-        diagnostics.dedupedAway = deletedMatches.length + liveMatches.length - evidence.length;
-        return evidence;
-    }
-
-    getEvidenceKey(match) {
-        if (match?.sourceMessageId) return `message:${match.sourceMessageId}`;
-        return [match?.authorKey || "unknown", match?.canonicalLink || "", Math.floor(Date.parse(match?.timestamp || 0) / 60000)].join("|");
-    }
-
-    summarize(matches) {
-        const byAuthor = new Map();
-        for (const match of matches) {
-            const row = byAuthor.get(match.authorKey) || {authorKey: match.authorKey, author: match.author, count: 0, eggChatLiveCount: 0, totalCount: 0, liveActiveMs: 0, liveActiveTime: "", logMessageIds: [], eggChatLiveMessageIds: [], sourceMessageIds: [], firstTimestamp: match.timestamp, lastTimestamp: match.timestamp};
-            if (!row.author || row.author === "Unknown author") row.author = match.author;
-            if (match.timestamp < row.firstTimestamp) row.firstTimestamp = match.timestamp;
-            if (match.timestamp > row.lastTimestamp) row.lastTimestamp = match.timestamp;
-            if (match.source === "egg-chat-live") { row.eggChatLiveCount += 1; if (match.liveMessageId) row.eggChatLiveMessageIds.push(match.liveMessageId); row.liveActiveMs += Number(match.activeMs) || 0; }
-            else { row.count += 1; if (match.logMessageId) row.logMessageIds.push(match.logMessageId); }
-            if (match.sourceMessageId) row.sourceMessageIds.push(match.sourceMessageId);
-            byAuthor.set(match.authorKey, row);
-        }
-        for (const row of byAuthor.values()) {
-            row.logMessageIds = Array.from(new Set(row.logMessageIds.filter(Boolean)));
-            row.eggChatLiveMessageIds = Array.from(new Set(row.eggChatLiveMessageIds.filter(Boolean)));
-            row.sourceMessageIds = Array.from(new Set(row.sourceMessageIds.filter(Boolean)));
-            row.totalCount = row.count + row.eggChatLiveCount;
-            row.liveActiveTime = formatDuration(row.liveActiveMs);
-        }
-        return Array.from(byAuthor.values()).sort((a, b) => b.totalCount - a.totalCount || b.count - a.count || String(a.author).localeCompare(String(b.author)));
-    }
-
-    async fetchMessagePage(channelId, before) {
-        const limit = Math.max(1, Math.min(100, Number(this.settings.pageLimit) || 100));
-        const endpoint = `/channels/${channelId}/messages?limit=${limit}${before ? `&before=${before}` : ""}`;
-        const data = await this.discordRequest(endpoint);
-        return Array.isArray(data) ? data : [];
-    }
-
-    getToken() {
+    async scanLive(startMs,endMs,diagnostics) { const matches = []; let before = timestampToSnowflake(endMs + 1), reachedStart = false; for (let page = 0; page < Number(this.settings.maxPages) && !reachedStart; page += 1) { const messages = await this.fetchMessagePage(this.settings.eggChatChannelId, before, diagnostics, "live"); diagnostics.livePages += 1; diagnostics.liveMessages += messages.length; if (!messages.length) break; for (const message of messages) { const timestamp = timestampFromMessage(message); if (timestamp && timestamp < startMs) { reachedStart = true; continue; } if (!timestamp || timestamp > endMs || timestamp < startMs) continue; const match = this.getLiveMatch(message, timestamp, endMs); if (match) { matches.push(match); diagnostics.liveMatches += 1; } } before = messages[messages.length - 1]?.id || ""; if (!before) break; if (!reachedStart) await wait(175); } return matches; }
+    async scanLogs(startMs,endMs,diagnostics) { const matches = []; let before = timestampToSnowflake(endMs + 1), reachedStart = false; for (let page = 0; page < Number(this.settings.maxPages) && !reachedStart; page += 1) { const messages = await this.fetchMessagePage(this.settings.serverLogsChannelId, before, diagnostics, "logs"); diagnostics.logPages += 1; diagnostics.logMessages += messages.length; if (!messages.length) break; for (const message of messages) { const timestamp = timestampFromMessage(message); if (timestamp && timestamp < startMs) { reachedStart = true; continue; } if (!timestamp || timestamp > endMs || timestamp < startMs) continue; const match = this.getDeletedLogMatch(message, timestamp, startMs, diagnostics); if (match) { matches.push(match); diagnostics.logMatches += 1; } } before = messages[messages.length - 1]?.id || ""; if (!before) break; if (!reachedStart) await wait(175); } return matches; }
+    async fetchMessagePage(channelId,before,diagnostics,source) { const detail = {source, channelId, before, attempts:[]}; const messages = await this.fetchMessagesWithDiscordActions(channelId, before, detail); diagnostics.actionAttempts.push(detail); return messages; }
+    async fetchMessagesWithDiscordActions(channelId,before,detail={}) {
         this.resolveModules();
-        for (const candidate of this.modules.authCandidates || []) {
-            try {
-                const found = candidate.module?.getToken?.();
-                if (typeof found === "string" && found.length > 20) return found;
-            } catch (_) {}
+        const actions = this.modules.MessageActions;
+        if (!actions) { this.recordActionAttempt(detail, "message actions unavailable", 0, null); return this.getCachedMessagesForChannel(channelId, before); }
+        const limit = Math.max(1, Math.min(100, Number(this.settings.pageLimit) || 100));
+        const methods = ["fetchMessages", "loadMessages"].filter(method => typeof actions[method] === "function");
+        const attempts = [];
+        for (const method of methods) {
+            attempts.push([`${method} object`, () => actions[method]({channelId, before, limit})]);
+            attempts.push([`${method} object guild`, () => actions[method]({channelId, guildId:this.getGuildId(), before, limit})]);
+            attempts.push([`${method} args`, () => actions[method](channelId, {before, limit})]);
+            attempts.push([`${method} args bool`, () => actions[method](channelId, before, limit)]);
         }
-        return "";
-    }
-
-    async discordRequest(endpoint) {
-        const found = this.getToken();
-        if (!found) throw new Error("Could not read Discord auth. Click 'Test Discord auth lookup' for details.");
-        const response = await this.fetch(`https://discord.com/api/v9${endpoint}`, {headers: {Authorization: found}});
-        const data = await this.readResponse(response);
-        const status = response?.status || response?.statusCode || 0;
-        const ok = response?.ok ?? (!status || (status >= 200 && status < 300));
-        if (!ok || (data?.code && data?.message)) throw new Error(`Discord API failed: ${status || "unknown"} ${data?.message || ""}`.trim());
-        return data;
-    }
-
-    async updateWebhook(result) {
-        if (!this.settings.webhookUrl) throw new Error("Set webhook URL in plugin settings");
-        const payload = {content: this.formatWebhookContent(result), allowed_mentions: {parse: []}};
-        const state = this.loadState();
-        const configuredMessageId = String(this.settings.webhookMessageId || "").trim();
-        let targetMessageId = configuredMessageId || String(state.messageId || "").trim();
-        let message = null;
-        let action = "";
-
-        if (targetMessageId) {
-            try { message = await this.webhookRequest(this.getWebhookMessageUrl(targetMessageId), "PATCH", payload); action = "patched"; }
-            catch (error) {
-                const isMissing = error?.status === 404 || /Unknown Message/i.test(error?.message || "");
-                if (configuredMessageId || !isMissing) throw error;
-                targetMessageId = "";
-            }
+        for (const [name, attempt] of attempts) {
+            try { const result = await attempt(); await wait(550); const messages = this.extractActionMessages(result, channelId, before); this.recordActionAttempt(detail, name, messages.length, result); if (messages.length) return messages; }
+            catch (error) { this.recordActionAttempt(detail, name, 0, null, error); }
         }
-
-        if (!message) {
-            message = await this.webhookRequest(this.getWebhookCreateUrl(), "POST", payload);
-            action = "created";
-            targetMessageId = String(message?.id || "").trim();
-            if (targetMessageId && !this.settings.webhookMessageId) {
-                this.settings.webhookMessageId = targetMessageId;
-                this.saveSettings();
-            }
-            if (!targetMessageId) BdApi.UI?.showToast?.("Posted, but Discord did not return the message ID. Copy that new message ID into Initialized webhook message ID.", {type: "info", timeout: 10000});
-        }
-        else targetMessageId = String(message?.id || targetMessageId).trim();
-
-        this.saveState(Object.assign({}, state, {messageId: targetMessageId, threadId: this.settings.threadId || "", lastAction: action, lastUpdatedAt: new Date().toISOString(), lastTotalMatches: result.totalMatches, lastAuthorCount: result.summary.length, lastError: ""}));
+        const cached = this.getCachedMessagesForChannel(channelId, before); this.recordActionAttempt(detail, "message cache final", cached.length, null); return cached;
     }
-
-    getWebhookCreateUrl() {
-        const base = this.settings.webhookUrl.replace(/\/+$/, "");
-        const params = new URLSearchParams({wait: "true"});
-        if (this.settings.threadId) params.set("thread_id", this.settings.threadId);
-        return `${base}?${params.toString()}`;
-    }
-
-    getWebhookMessageUrl(messageId) {
-        const base = this.settings.webhookUrl.replace(/\/+$/, "");
-        const params = new URLSearchParams();
-        if (this.settings.threadId) params.set("thread_id", this.settings.threadId);
-        const query = params.toString();
-        return `${base}/messages/${encodeURIComponent(messageId)}${query ? `?${query}` : ""}`;
-    }
-
-    async webhookRequest(url, method, payload) {
-        const response = await this.fetch(url, {method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
-        const data = await this.readResponse(response);
-        const status = response?.status || response?.statusCode || 0;
-        const ok = response?.ok ?? (!status || (status >= 200 && status < 300));
-        if (!ok || (data?.code && data?.message)) {
-            const error = new Error(`Webhook ${method} failed: ${status || "unknown"} ${data?.message || ""}`.trim());
-            error.status = status;
-            throw error;
-        }
-        return data || {};
-    }
-
-    formatWebhookContent(result) {
-        const now = Math.floor(Date.now() / 1000);
-        const start = Math.floor(Date.parse(result.start) / 1000);
-        const end = Math.floor(Date.parse(result.end) / 1000);
-        const diagnostics = result.diagnostics || {};
-        const lines = [
-            "**C0LD Egg Server Leaderboard**",
-            `_Window <t:${start}:f> to <t:${end}:f> • Updated <t:${now}:R>_`,
-            `_Counted ${result.totalMatches} unique private-server posts across ${result.summary.length} members._`
-        ];
-        if (this.settings.showDiagnostics) lines.push(this.formatDiagnostics(diagnostics));
-        lines.push("", "```text", `${"rank".padEnd(5)} ${"author".padEnd(46)} total  del  live`);
-        const footer = ["```"];
-        for (let index = 0; index < result.summary.length; index += 1) {
-            const row = result.summary[index];
-            const line = `${String(index + 1).padEnd(5)} ${this.truncateCell(row.author || row.authorKey || "Unknown", 46).padEnd(46)} ${String(row.totalCount || 0).padEnd(5)} ${String(row.count || 0).padEnd(4)} ${String(row.eggChatLiveCount || 0)}`;
-            if (lines.concat(line, footer).join("\n").length > Number(this.settings.contentLimit || 1950)) break;
-            lines.push(line);
-        }
-        if (lines[lines.length - 1].includes("total  del  live")) lines.push(`${"-".padEnd(5)} ${"No matching posts found".padEnd(46)} 0      0    0`);
-        lines.push(...footer);
-        return lines.join("\n");
-    }
-
-    formatDiagnostics(diagnostics) {
-        const rejected = diagnostics.rejected || {};
-        const rejectText = Object.entries(rejected).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([key, value]) => `${key}:${value}`).join(", ") || "none";
-        return `_Diag live ${diagnostics.livePages || 0}p/${diagnostics.liveMessages || 0}m/${diagnostics.liveMatches || 0} hits • logs ${diagnostics.logPages || 0}p/${diagnostics.logMessages || 0}m/${diagnostics.logMatches || 0} hits • dedupe ${diagnostics.dedupedAway || 0} • rejects ${rejectText}_`;
-    }
-
-    truncateCell(value, length) {
-        const text = clean(value).replace(/\s+/g, " ").replace(/`/g, "'").trim();
-        return text.length <= length ? text : `${text.slice(0, length - 3)}...`;
-    }
-
-    loadState() {
-        try { return BdApi.Data.load(PLUGIN_NAME, STATE_KEY) || {}; }
-        catch (_) { return {}; }
-    }
-
-    saveState(state) {
-        BdApi.Data.save(PLUGIN_NAME, STATE_KEY, state || {});
-    }
-
-    async fetch(url, options) {
-        if (typeof BdApi?.Net?.fetch === "function") return BdApi.Net.fetch(url, options);
-        if (typeof fetch === "function") return fetch(url, options);
-        throw new Error("No fetch available");
-    }
-
-    async readResponse(response) {
-        if (!response) return null;
-        for (const key of ["body", "data", "rawBody"]) {
-            if (response[key] !== undefined && response[key] !== "") return this.parseResponse(response[key]);
-        }
-        if (typeof response.json === "function") { try { return this.parseResponse(await response.json()); } catch (_) {} }
-        if (typeof response.text === "function") { try { return this.parseResponse(await response.text()); } catch (_) {} }
-        return this.parseResponse(response);
-    }
-
-    parseResponse(value) {
-        if (typeof value === "string") { try { return value ? JSON.parse(value) : null; } catch (_) { return value; } }
-        return value;
-    }
-
-    getMessageAuthorId(message) {
-        const author = this.readValue(message, ["author"]);
-        if (typeof author === "string" && /^\d{14,24}$/.test(author)) return author;
-        return this.readText(author, ["id"]) || this.readText(message, ["authorId", "author_id", "userId", "user_id"]) || "";
-    }
-
-    getLiveAuthorContext(message) {
-        const author = this.readValue(message, ["author"]) || {};
-        const id = this.getMessageAuthorId(message);
-        const username = this.readText(author, ["username", "name", "tag"]);
-        const globalName = this.readText(author, ["globalName", "global_name", "displayName", "nick"]);
-        let line = "";
-        if (globalName && username && globalName !== username) line = `${globalName} (@${username})${id ? ` (<@${id}>)` : ""}`;
-        else if (globalName) line = `${globalName}${id ? ` (<@${id}>)` : ""}`;
-        else if (username) line = `${username}${id ? ` (<@${id}>)` : ""}`;
-        else if (id) line = `<@${id}>`;
-        return {id, line, key: id ? `<@${id}>` : this.normalizeAuthorKey(line)};
-    }
-
-    normalizeAuthorKey(authorLine) {
-        const text = clean(authorLine).replace(/\s+/g, " ").trim();
-        const mentionId = text.match(/<@!?(\d{14,24})>/)?.[1];
-        if (mentionId) return `<@${mentionId}>`;
-        const leadingHandle = text.match(/@([^\s()]+)(?:\s|\(|$)/)?.[1];
-        if (leadingHandle) return leadingHandle.toLowerCase();
-        const parenthetical = text.match(/\((@?[^()]+)\)/)?.[1];
-        return (parenthetical || text).replace(/^@/, "").replace(/\s+/g, " ").trim().toLowerCase() || "unknown";
-    }
-
-    flattenMessage(message) {
-        const parts = [];
-        this.collectTextParts(message, parts);
-        return clean(parts.filter(Boolean).join("\n"));
-    }
-
-    collectTextParts(source, parts, seen = new Set(), depth = 0) {
-        if (!source || depth > 6) return;
-        if (typeof source === "string") { parts.push(source); return; }
-        if (Array.isArray(source) || source instanceof Map || source instanceof Set) {
-            for (const item of this.toArray(source)) this.collectTextParts(item, parts, seen, depth + 1);
-            return;
-        }
-        if (typeof source !== "object" || seen.has(source)) return;
-        seen.add(source);
-        parts.push(this.readText(source, ["content", "cleanContent", "rawContent", "text"]));
-        for (const embed of this.toArray(this.readValue(source, ["embeds", "rawEmbeds"]))) {
-            parts.push(this.readText(embed, ["title", "rawTitle"]), this.readText(embed, ["description", "rawDescription"]), this.readText(embed, ["url", "rawUrl"]), this.readText(this.readValue(embed, ["footer", "rawFooter"]), ["text", "rawText"]), this.readText(this.readValue(embed, ["author", "rawAuthor"]), ["name", "rawName"]));
-            for (const field of this.toArray(this.readValue(embed, ["fields", "rawFields", "_fields"]))) {
-                const name = this.readText(field, ["name", "rawName"]);
-                const value = this.readText(field, ["value", "rawValue"]);
-                if (name || value) parts.push(`${name}: ${value}`);
-            }
-        }
-        for (const attachment of this.toArray(this.readValue(source, ["attachments", "rawAttachments"]))) parts.push(this.readText(attachment, ["url", "rawUrl"]), this.readText(attachment, ["proxyUrl", "proxy_url"]), this.readText(attachment, ["filename", "name", "title", "description"]));
-        for (const key of ["messageSnapshots", "message_snapshots", "messageSnapshot", "message_snapshot", "snapshots", "forwardedMessages", "forwarded_messages", "forwardedMessage", "forwarded_message", "message", "snapshot", "sourceMessage", "source_message", "referencedMessage", "referenced_message", "originalMessage", "original_message"]) {
-            const nested = this.readValue(source, [key]);
-            if (nested) this.collectTextParts(nested, parts, seen, depth + 1);
-        }
-    }
-
-    getLogFieldValues(message, label, flattenedText) {
-        const values = [];
-        const wanted = this.normalizeLogLabel(label);
-        for (const embed of this.toArray(this.readValue(message, ["embeds", "rawEmbeds"]))) {
-            for (const field of this.toArray(this.readValue(embed, ["fields", "rawFields", "_fields"]))) {
-                const name = this.readText(field, ["name", "rawName"]);
-                const value = this.readText(field, ["value", "rawValue"]);
-                if (this.normalizeLogLabel(name) === wanted && value) values.push(clean(value).trim());
-            }
-        }
-        const plain = clean(flattenedText).replace(/```/g, "").replace(/\*\*/g, "").replace(/`/g, "");
-        values.push(...this.getColonLabelBlocks(label, plain));
-        values.push(...this.getStandaloneHeaderBlocks(label, plain));
-        return Array.from(new Set(values.filter(Boolean)));
-    }
-
-    getColonLabelBlocks(label, text) {
-        const values = [];
-        const escapedLabel = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const lineRegex = new RegExp(`^\\s*(?:[>\\-•]\\s*)?${escapedLabel}\\s*[:：]\\s*(.*)$`, "i");
-        const lines = text.split("\n");
-        for (let index = 0; index < lines.length; index += 1) {
-            const match = lines[index].match(lineRegex);
-            if (!match) continue;
-            const block = [match[1].trim()].filter(Boolean);
-            for (let next = index + 1; next < lines.length; next += 1) {
-                const line = lines[next].trim();
-                if (this.isBlockStopLine(line)) break;
-                if (line) block.push(line);
-            }
-            values.push(block.join("\n").trim());
-        }
-        return values;
-    }
-
-    getStandaloneHeaderBlocks(label, text) {
-        const values = [];
-        const wanted = this.normalizeLogLabel(label);
-        const lines = text.split("\n");
-        for (let index = 0; index < lines.length; index += 1) {
-            const current = this.normalizeLogLabel(lines[index]);
-            if (current !== wanted) continue;
-            const block = [];
-            for (let next = index + 1; next < lines.length; next += 1) {
-                const line = lines[next].trim();
-                if (this.isBlockStopLine(line)) break;
-                if (line) block.push(line);
-            }
-            values.push(block.join("\n").trim());
-        }
-        return values;
-    }
-
-    getFirstLogFieldValue(message, labels, flattenedText) {
-        for (const label of labels) {
-            const value = this.getLogFieldValues(message, label, flattenedText)[0];
-            if (value) return value;
-        }
-        return "";
-    }
-
-    isBlockStopLine(line) {
-        const text = String(line || "").trim();
-        if (!text) return false;
-        if (/^https?:\/\//i.test(text)) return false;
-        if (/^\d+\s+Attachment\(s\)/i.test(text)) return true;
-        if (/^\d{1,2}\/\d{1,2}\/\d{4},/i.test(text)) return true;
-        return this.looksLikeLogLabelLine(text) || ["message", "channel", "message id", "message author", "message created", "author", "user"].includes(this.normalizeLogLabel(text));
-    }
-
-    looksLikeLogLabelLine(line) {
-        const text = String(line || "").trim();
-        if (/^https?:\/\//i.test(text)) return false;
-        return /^(?:[>\-•]\s*)?[A-Za-z][A-Za-z0-9 _-]{1,44}\s*[:：]/.test(text);
-    }
-
-    normalizeLogLabel(value) {
-        return clean(value).replace(/[>*_`~|]/g, "").replace(/[:：]/g, "").trim().toLowerCase();
-    }
-
-    hasEggChatReference(text, channelValues) {
-        return [text].concat(channelValues).some(value => {
-            const raw = clean(value).toLowerCase();
-            const normalized = normalize(value);
-            return raw.includes(String(this.settings.eggChatChannelId)) || normalized.includes("egg chat") || normalized.includes("eggchat");
-        });
-    }
-
-    getShareMessageValue(messageValues, flattenedText) {
-        const fieldMatch = messageValues.find(value => this.extractCanonicalLink(value));
-        if (fieldMatch) return fieldMatch;
-        const messageBlock = this.extractMessageBlock(flattenedText);
-        if (this.extractCanonicalLink(messageBlock)) return messageBlock;
-        return flattenedText.split("\n").find(line => this.extractCanonicalLink(line))?.trim() || "";
-    }
-
-    extractMessageBlock(text) {
-        const plain = clean(text).replace(/\*\*/g, "").replace(/`/g, "");
-        const colonBlocks = this.getColonLabelBlocks("Message", plain).filter(value => this.extractCanonicalLink(value));
-        if (colonBlocks[0]) return colonBlocks[0];
-        const headerBlocks = this.getStandaloneHeaderBlocks("Message", plain).filter(value => this.extractCanonicalLink(value));
-        return headerBlocks[0] || "";
-    }
-
-    extractCanonicalLink(value) {
-        const text = clean(value);
-        for (const pattern of SHARE_PATTERNS) {
-            pattern.lastIndex = 0;
-            const match = text.match(pattern);
-            if (!match) continue;
-            const raw = match[1]?.startsWith("/") ? `https://www.roblox.com${match[1]}` : match[0];
-            return raw.trim().replace(/[),.]+$/g, "").replace(/&amp;/g, "&");
-        }
-        return "";
-    }
-
-    extractSourceMessageId(message, flattenedText) {
-        return String(this.getFirstLogFieldValue(message, ["Message ID", "Message Id", "Deleted Message ID", "Deleted Message Id"], flattenedText) || "").match(/\d{14,24}/)?.[0] || "";
-    }
-
-    extractMentionPair(text) {
-        const cleanText = clean(text);
-        return cleanText.match(/@[\w.'-]{2,40}\s*\([^\n]+\)/)?.[0] || cleanText.match(/<@!?\d{14,24}>/)?.[0] || "";
-    }
-
-    readValue(source, keys) {
-        if (!source) return undefined;
-        const candidates = [source];
-        try { if (typeof source.toJS === "function") candidates.push(source.toJS()); } catch (_) {}
-        for (const candidate of candidates) {
-            if (!candidate) continue;
-            for (const key of keys) {
-                try { const value = candidate[key]; if (value !== undefined && typeof value !== "function") return value; } catch (_) {}
-                try { if (typeof candidate.get === "function") { const value = candidate.get(key); if (value !== undefined && typeof value !== "function") return value; } } catch (_) {}
-            }
-        }
-        return undefined;
-    }
-
-    readText(source, keys) {
-        const value = this.readValue(source, keys);
-        if (value === undefined || value === null) return "";
-        if (typeof value === "string") return value;
-        if (typeof value === "number" || typeof value === "boolean") return String(value);
-        try { if (typeof value.toString === "function" && value.toString !== Object.prototype.toString) { const text = value.toString(); return text === "[object Object]" ? "" : text; } } catch (_) {}
-        return "";
-    }
-
-    toArray(value) {
-        if (!value) return [];
-        if (Array.isArray(value)) return value;
-        if (value instanceof Map || value instanceof Set) return Array.from(value.values());
-        try { if (typeof value.toArray === "function") return value.toArray(); } catch (_) {}
-        try { if (typeof value.toJS === "function") { const raw = value.toJS(); return Array.isArray(raw) ? raw : (raw && typeof raw === "object" ? Object.values(raw) : []); } } catch (_) {}
-        return typeof value === "object" ? Object.values(value) : [];
-    }
-
-    getGuildId() {
-        return String(location?.pathname || "").match(/\/channels\/(\d+)/)?.[1] || "";
-    }
+    extractActionMessages(result,channelId,before) { const direct = this.extractDiscordMessages(result).concat(toMessageArray(result)); const cached = this.getCachedMessagesForChannel(channelId, before); return this.filterMessagePage(direct.concat(cached), before); }
+    extractDiscordMessages(result) { const value = this.normalizeResponse(result); if (Array.isArray(value)) return value; for (const path of [value?.body, value?.data, value?.messages, value?.body?.messages, value?.data?.messages, value?.results]) { if (Array.isArray(path)) return path.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined)); } return []; }
+    normalizeResponse(result) { let value = result; for (let i = 0; i < 4; i += 1) { if (value?.body !== undefined) value = value.body; else if (value?.data !== undefined) value = value.data; else if (value?.response?.body !== undefined) value = value.response.body; else if (value?.rawBody !== undefined) value = value.rawBody; else break; } if (typeof value === "string") { try { return JSON.parse(value); } catch (_) {} } return value; }
+    getCachedMessagesForChannel(channelId,before) { const store = this.modules.MessageStore; const sources = [this.safeCall(store,"getMessages",channelId), this.safeCall(store,"getMessagesForChannel",channelId), this.safeCall(store,"getMessageIds",channelId), this.safeCall(store,"getRawMessages",channelId)]; const messages = []; for (const source of sources) { messages.push(...toMessageArray(source)); for (const id of collectSnowflakeIds(source)) { const message = this.safeCall(store,"getMessage",channelId,id) || this.safeCall(store,"getMessage",id) || this.safeCall(store,"getMessageById",channelId,id) || this.safeCall(store,"getMessageById",id); if (message) messages.push(message); } } return this.filterMessagePage(messages, before); }
+    filterMessagePage(messages,before) { const beforeTime = snowflakeToTimestamp(before) || Infinity; const deduped = new Map(); for (const message of messages) { if (!message?.id) continue; const timestamp = timestampFromMessage(message) || snowflakeToTimestamp(message.id); if (timestamp && timestamp >= beforeTime) continue; deduped.set(message.id, message); } return Array.from(deduped.values()).sort((a,b) => (timestampFromMessage(b) || snowflakeToTimestamp(b.id)) - (timestampFromMessage(a) || snowflakeToTimestamp(a.id))).slice(0, Math.max(1, Math.min(100, Number(this.settings.pageLimit) || 100))); }
+    recordActionAttempt(detail,method,messageCount,result,error=null) { if (!detail?.attempts) return; detail.attempts.push({method, count:messageCount, resultType:Array.isArray(result)?"array":(result === null || result === undefined ? "null" : typeof result), keys:result && typeof result === "object" && !Array.isArray(result) ? Object.keys(result).slice(0,8).join(" ") : "", error:error?.message || ""}); }
+    safeCall(target,method,...args) { try { if (typeof target?.[method] === "function") return target[method](...args); } catch (_) {} return undefined; }
+    reject(diagnostics,reason,message=null) { diagnostics.rejected[reason] = (diagnostics.rejected[reason] || 0) + 1; if (message && diagnostics.samples.length < 6) diagnostics.samples.push({reason, snippet:this.flattenMessage(message).slice(0,260)}); }
+    getDeletedLogMatch(message,logTimestamp,startMs,diagnostics) { const text = this.flattenMessage(message); if (this.getMessageAuthorId(message) !== String(this.settings.sapphireBotUserId)) { this.reject(diagnostics,"not_sapphire"); return null; } if (!/message\s+deleted/i.test(text)) { this.reject(diagnostics,"not_deleted_log"); return null; } const channelValues = this.getLogFieldValues(message,"Channel",text); if (!this.hasEggChatReference(text, channelValues)) { this.reject(diagnostics,"not_egg_chat",message); return null; } const shareMessage = this.getShareMessageValue(this.getLogFieldValues(message,"Message",text), text); if (!shareMessage) { this.reject(diagnostics,"no_link_in_message_block",message); return null; } const sourceMessageId = this.extractSourceMessageId(message,text); const sourceTimestamp = sourceMessageId ? snowflakeToTimestamp(sourceMessageId) : logTimestamp; const endTimestamp = Date.parse(this.settings.endLocal); if (!sourceTimestamp || sourceTimestamp < startMs || sourceTimestamp > endTimestamp) { this.reject(diagnostics,"source_outside_window",message); return null; } const author = this.getFirstLogFieldValue(message,["Message author","Message Author","Author","User"],text) || this.extractMentionPair(text) || "Unknown author"; const guildId = this.getGuildId() || "@me"; return {source:"server-log", author, authorKey:this.normalizeAuthorKey(author), sourceMessageId, canonicalLink:this.extractCanonicalLink(shareMessage), logMessageId:message.id, timestamp:new Date(sourceTimestamp).toISOString(), deletedLogTimestamp:new Date(logTimestamp).toISOString(), messageUrl:`https://discord.com/channels/${guildId}/${this.settings.serverLogsChannelId}/${message.id}`, message:shareMessage}; }
+    getLiveMatch(message,timestamp,activeUntil) { const text = this.flattenMessage(message); const shareMessage = this.getShareMessageValue([], text); if (!shareMessage) return null; const author = this.getLiveAuthorContext(message); const guildId = this.getGuildId() || "@me"; const activeMs = Math.max(0, activeUntil - timestamp); return {source:"egg-chat-live", author:author.line || "Unknown author", authorKey:author.key || this.normalizeAuthorKey(author.line), sourceMessageId:message.id, canonicalLink:this.extractCanonicalLink(shareMessage), liveMessageId:message.id, timestamp:new Date(timestamp).toISOString(), activeMs, activeDuration:formatDuration(activeMs), messageUrl:`https://discord.com/channels/${guildId}/${this.settings.eggChatChannelId}/${message.id}`, message:shareMessage}; }
+    dedupeEvidence(deletedMatches,liveMatches,diagnostics) { const byKey = new Map(); for (const match of liveMatches) byKey.set(this.getEvidenceKey(match), match); for (const match of deletedMatches) byKey.set(this.getEvidenceKey(match), match); const evidence = Array.from(byKey.values()).sort((a,b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)); diagnostics.dedupedAway = deletedMatches.length + liveMatches.length - evidence.length; return evidence; }
+    getEvidenceKey(match) { return match?.sourceMessageId ? `message:${match.sourceMessageId}` : [match?.authorKey || "unknown", match?.canonicalLink || "", Math.floor(Date.parse(match?.timestamp || 0) / 60000)].join("|"); }
+    summarize(matches) { const byAuthor = new Map(); for (const match of matches) { const row = byAuthor.get(match.authorKey) || {authorKey:match.authorKey, author:match.author, count:0, eggChatLiveCount:0, totalCount:0, liveActiveMs:0, liveActiveTime:"", logMessageIds:[], eggChatLiveMessageIds:[], sourceMessageIds:[], firstTimestamp:match.timestamp, lastTimestamp:match.timestamp}; if (!row.author || row.author === "Unknown author") row.author = match.author; if (match.timestamp < row.firstTimestamp) row.firstTimestamp = match.timestamp; if (match.timestamp > row.lastTimestamp) row.lastTimestamp = match.timestamp; if (match.source === "egg-chat-live") { row.eggChatLiveCount += 1; if (match.liveMessageId) row.eggChatLiveMessageIds.push(match.liveMessageId); row.liveActiveMs += Number(match.activeMs) || 0; } else { row.count += 1; if (match.logMessageId) row.logMessageIds.push(match.logMessageId); } if (match.sourceMessageId) row.sourceMessageIds.push(match.sourceMessageId); byAuthor.set(match.authorKey, row); } for (const row of byAuthor.values()) { row.logMessageIds = Array.from(new Set(row.logMessageIds.filter(Boolean))); row.eggChatLiveMessageIds = Array.from(new Set(row.eggChatLiveMessageIds.filter(Boolean))); row.sourceMessageIds = Array.from(new Set(row.sourceMessageIds.filter(Boolean))); row.totalCount = row.count + row.eggChatLiveCount; row.liveActiveTime = formatDuration(row.liveActiveMs); } return Array.from(byAuthor.values()).sort((a,b) => b.totalCount - a.totalCount || b.count - a.count || String(a.author).localeCompare(String(b.author))); }
+    async updateWebhook(result) { if (!this.settings.webhookUrl) throw new Error("Set webhook URL in plugin settings"); const payload = {content:this.formatWebhookContent(result), allowed_mentions:{parse:[]}}; const state = this.loadState(); const configuredMessageId = String(this.settings.webhookMessageId || "").trim(); let targetMessageId = configuredMessageId || String(state.messageId || "").trim(); let message = null, action = ""; if (targetMessageId) { try { message = await this.webhookRequest(this.getWebhookMessageUrl(targetMessageId), "PATCH", payload); action = "patched"; } catch(error) { const isMissing = error?.status === 404 || /Unknown Message/i.test(error?.message || ""); if (configuredMessageId || !isMissing) throw error; targetMessageId = ""; } } if (!message) { message = await this.webhookRequest(this.getWebhookCreateUrl(), "POST", payload); action = "created"; targetMessageId = String(message?.id || "").trim(); if (targetMessageId && !this.settings.webhookMessageId) { this.settings.webhookMessageId = targetMessageId; this.saveSettings(); } if (!targetMessageId) BdApi.UI?.showToast?.("Posted, but Discord did not return the message ID. Copy that new message ID into Initialized webhook message ID.", {type:"info", timeout:10000}); } else targetMessageId = String(message?.id || targetMessageId).trim(); this.saveState(Object.assign({}, state, {messageId:targetMessageId, threadId:this.settings.threadId || "", lastAction:action, lastUpdatedAt:new Date().toISOString(), lastTotalMatches:result.totalMatches, lastAuthorCount:result.summary.length, lastError:""})); }
+    getWebhookCreateUrl() { const base = this.settings.webhookUrl.replace(/\/+$/, ""); const params = new URLSearchParams({wait:"true"}); if (this.settings.threadId) params.set("thread_id", this.settings.threadId); return `${base}?${params.toString()}`; }
+    getWebhookMessageUrl(messageId) { const base = this.settings.webhookUrl.replace(/\/+$/, ""); const params = new URLSearchParams(); if (this.settings.threadId) params.set("thread_id", this.settings.threadId); const query = params.toString(); return `${base}/messages/${encodeURIComponent(messageId)}${query ? `?${query}` : ""}`; }
+    async webhookRequest(url,method,payload) { const response = await this.fetch(url, {method, headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)}); const data = await this.readResponse(response); const status = response?.status || response?.statusCode || 0; const ok = response?.ok ?? (!status || (status >= 200 && status < 300)); if (!ok || (data?.code && data?.message)) { const error = new Error(`Webhook ${method} failed: ${status || "unknown"} ${data?.message || ""}`.trim()); error.status = status; throw error; } return data || {}; }
+    formatWebhookContent(result) { const now = Math.floor(Date.now()/1000), start = Math.floor(Date.parse(result.start)/1000), end = Math.floor(Date.parse(result.end)/1000), diagnostics = result.diagnostics || {}; const lines = ["**C0LD Egg Server Leaderboard**", `_Window <t:${start}:f> to <t:${end}:f> • Updated <t:${now}:R>_`, `_Counted ${result.totalMatches} unique private-server posts across ${result.summary.length} members._`]; if (this.settings.showDiagnostics) lines.push(this.formatDiagnostics(diagnostics)); lines.push("", "```text", `${"rank".padEnd(5)} ${"author".padEnd(46)} total  del  live`); const footer = ["```"]; for (let index = 0; index < result.summary.length; index += 1) { const row = result.summary[index]; const line = `${String(index + 1).padEnd(5)} ${this.truncateCell(row.author || row.authorKey || "Unknown", 46).padEnd(46)} ${String(row.totalCount || 0).padEnd(5)} ${String(row.count || 0).padEnd(4)} ${String(row.eggChatLiveCount || 0)}`; if (lines.concat(line, footer).join("\n").length > Number(this.settings.contentLimit || 1950)) break; lines.push(line); } if (lines[lines.length - 1].includes("total  del  live")) lines.push(`${"-".padEnd(5)} ${"No matching posts found".padEnd(46)} 0      0    0`); lines.push(...footer); return lines.join("\n"); }
+    formatDiagnostics(diagnostics) { const rejected = diagnostics.rejected || {}; const rejectText = Object.entries(rejected).sort((a,b) => b[1] - a[1]).slice(0,4).map(([key,value]) => `${key}:${value}`).join(", ") || "none"; const last = diagnostics.actionAttempts?.slice(-1)[0]; const loader = last ? ` • loader ${last.source}:${last.attempts?.map(a => `${a.method}:${a.count}`).join("/").slice(0,90)}` : ""; return `_Diag live ${diagnostics.livePages || 0}p/${diagnostics.liveMessages || 0}m/${diagnostics.liveMatches || 0} hits • logs ${diagnostics.logPages || 0}p/${diagnostics.logMessages || 0}m/${diagnostics.logMatches || 0} hits • dedupe ${diagnostics.dedupedAway || 0} • rejects ${rejectText}${loader}_`; }
+    truncateCell(value,length) { const text = clean(value).replace(/\s+/g," ").replace(/`/g,"'").trim(); return text.length <= length ? text : `${text.slice(0, length - 3)}...`; }
+    loadState() { try { return BdApi.Data.load(PLUGIN_NAME, STATE_KEY) || {}; } catch(_) { return {}; } }
+    saveState(state) { BdApi.Data.save(PLUGIN_NAME, STATE_KEY, state || {}); }
+    async fetch(url,options) { if (typeof BdApi?.Net?.fetch === "function") return BdApi.Net.fetch(url, options); if (typeof fetch === "function") return fetch(url, options); throw new Error("No fetch available"); }
+    async readResponse(response) { if (!response) return null; if (Array.isArray(response)) return response; if (typeof response === "string") return this.parseResponse(response); if (typeof response.json === "function") { try { return this.parseResponse(await response.json()); } catch(_) {} } if (typeof response.text === "function") { try { return this.parseResponse(await response.text()); } catch(_) {} } for (const key of ["data","body","rawBody"]) { const value = response[key]; if (value === undefined || value === null || value === "") continue; if (typeof value === "string") return this.parseResponse(value); if (Array.isArray(value)) return value; if (typeof value === "object") return value; } return response; }
+    parseResponse(value) { if (typeof value === "string") { try { return value ? JSON.parse(value) : null; } catch(_) { return value; } } return value; }
+    getMessageAuthorId(message) { const author = this.readValue(message, ["author"]); if (typeof author === "string" && /^\d{14,24}$/.test(author)) return author; return this.readText(author, ["id"]) || this.readText(message, ["authorId","author_id","userId","user_id"]) || ""; }
+    getLiveAuthorContext(message) { const author = this.readValue(message,["author"]) || {}, id = this.getMessageAuthorId(message), username = this.readText(author,["username","name","tag"]), globalName = this.readText(author,["globalName","global_name","displayName","nick"]); let line = ""; if (globalName && username && globalName !== username) line = `${globalName} (@${username})${id ? ` (<@${id}>)` : ""}`; else if (globalName) line = `${globalName}${id ? ` (<@${id}>)` : ""}`; else if (username) line = `${username}${id ? ` (<@${id}>)` : ""}`; else if (id) line = `<@${id}>`; return {id, line, key:id ? `<@${id}>` : this.normalizeAuthorKey(line)}; }
+    normalizeAuthorKey(authorLine) { const text = clean(authorLine).replace(/\s+/g," ").trim(); const mentionId = text.match(/<@!?(\d{14,24})>/)?.[1]; if (mentionId) return `<@${mentionId}>`; const leadingHandle = text.match(/@([^\s()]+)(?:\s|\(|$)/)?.[1]; if (leadingHandle) return leadingHandle.toLowerCase(); const parenthetical = text.match(/\((@?[^()]+)\)/)?.[1]; return (parenthetical || text).replace(/^@/, "").replace(/\s+/g," ").trim().toLowerCase() || "unknown"; }
+    flattenMessage(message) { const parts = []; this.collectTextParts(message, parts); return clean(parts.filter(Boolean).join("\n")); }
+    collectTextParts(source,parts,seen=new Set(),depth=0) { if (!source || depth > 6) return; if (typeof source === "string") { parts.push(source); return; } if (Array.isArray(source) || source instanceof Map || source instanceof Set) { for (const item of this.toArray(source)) this.collectTextParts(item,parts,seen,depth+1); return; } if (typeof source !== "object" || seen.has(source)) return; seen.add(source); parts.push(this.readText(source,["content","cleanContent","rawContent","text"])); for (const embed of this.toArray(this.readValue(source,["embeds","rawEmbeds"]))) { parts.push(this.readText(embed,["title","rawTitle"]), this.readText(embed,["description","rawDescription"]), this.readText(embed,["url","rawUrl"]), this.readText(this.readValue(embed,["footer","rawFooter"]),["text","rawText"]), this.readText(this.readValue(embed,["author","rawAuthor"]),["name","rawName"])); for (const field of this.toArray(this.readValue(embed,["fields","rawFields","_fields"]))) { const name = this.readText(field,["name","rawName"]), value = this.readText(field,["value","rawValue"]); if (name || value) parts.push(`${name}: ${value}`); } } for (const attachment of this.toArray(this.readValue(source,["attachments","rawAttachments"]))) parts.push(this.readText(attachment,["url","rawUrl"]), this.readText(attachment,["proxyUrl","proxy_url"]), this.readText(attachment,["filename","name","title","description"])); for (const key of ["messageSnapshots","message_snapshots","messageSnapshot","message_snapshot","snapshots","forwardedMessages","forwarded_messages","forwardedMessage","forwarded_message","message","snapshot","sourceMessage","source_message","referencedMessage","referenced_message","originalMessage","original_message"]) { const nested = this.readValue(source,[key]); if (nested) this.collectTextParts(nested,parts,seen,depth+1); } }
+    getLogFieldValues(message,label,flattenedText) { const values = [], wanted = this.normalizeLogLabel(label); for (const embed of this.toArray(this.readValue(message,["embeds","rawEmbeds"]))) { for (const field of this.toArray(this.readValue(embed,["fields","rawFields","_fields"]))) { const name = this.readText(field,["name","rawName"]), value = this.readText(field,["value","rawValue"]); if (this.normalizeLogLabel(name) === wanted && value) values.push(clean(value).trim()); } } const plain = clean(flattenedText).replace(/```/g,"").replace(/\*\*/g,"").replace(/`/g,""); values.push(...this.getColonLabelBlocks(label, plain)); values.push(...this.getStandaloneHeaderBlocks(label, plain)); return Array.from(new Set(values.filter(Boolean))); }
+    getColonLabelBlocks(label,text) { const values = []; const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); const lineRegex = new RegExp(`^\\s*(?:[>\\-•]\\s*)?${escaped}\\s*[:：]\\s*(.*)$`, "i"); const lines = text.split("\n"); for (let index = 0; index < lines.length; index += 1) { const match = lines[index].match(lineRegex); if (!match) continue; const block = [match[1].trim()].filter(Boolean); for (let next = index + 1; next < lines.length; next += 1) { const line = lines[next].trim(); if (this.isBlockStopLine(line)) break; if (line) block.push(line); } values.push(block.join("\n").trim()); } return values; }
+    getStandaloneHeaderBlocks(label,text) { const values = [], wanted = this.normalizeLogLabel(label), lines = text.split("\n"); for (let index = 0; index < lines.length; index += 1) { if (this.normalizeLogLabel(lines[index]) !== wanted) continue; const block = []; for (let next = index + 1; next < lines.length; next += 1) { const line = lines[next].trim(); if (this.isBlockStopLine(line)) break; if (line) block.push(line); } values.push(block.join("\n").trim()); } return values; }
+    getFirstLogFieldValue(message,labels,flattenedText) { for (const label of labels) { const value = this.getLogFieldValues(message,label,flattenedText)[0]; if (value) return value; } return ""; }
+    isBlockStopLine(line) { const text = String(line || "").trim(); if (!text) return false; if (/^https?:\/\//i.test(text)) return false; if (/^\d+\s+Attachment\(s\)/i.test(text)) return true; if (/^\d{1,2}\/\d{1,2}\/\d{4},/i.test(text)) return true; return this.looksLikeLogLabelLine(text) || ["message","channel","message id","message author","message created","author","user"].includes(this.normalizeLogLabel(text)); }
+    looksLikeLogLabelLine(line) { const text = String(line || "").trim(); if (/^https?:\/\//i.test(text)) return false; return /^(?:[>\-•]\s*)?[A-Za-z][A-Za-z0-9 _-]{1,44}\s*[:：]/.test(text); }
+    normalizeLogLabel(value) { return clean(value).replace(/[>*_`~|]/g,"").replace(/[:：]/g,"").trim().toLowerCase(); }
+    hasEggChatReference(text,channelValues) { return [text].concat(channelValues).some(value => { const raw = clean(value).toLowerCase(), normalized = normalize(value); return raw.includes(String(this.settings.eggChatChannelId)) || normalized.includes("egg chat") || normalized.includes("eggchat"); }); }
+    getShareMessageValue(messageValues,flattenedText) { const fieldMatch = messageValues.find(value => this.extractCanonicalLink(value)); if (fieldMatch) return fieldMatch; const messageBlock = this.extractMessageBlock(flattenedText); if (this.extractCanonicalLink(messageBlock)) return messageBlock; return flattenedText.split("\n").find(line => this.extractCanonicalLink(line))?.trim() || ""; }
+    extractMessageBlock(text) { const plain = clean(text).replace(/\*\*/g,"").replace(/`/g,""); const colonBlocks = this.getColonLabelBlocks("Message", plain).filter(value => this.extractCanonicalLink(value)); if (colonBlocks[0]) return colonBlocks[0]; const headerBlocks = this.getStandaloneHeaderBlocks("Message", plain).filter(value => this.extractCanonicalLink(value)); return headerBlocks[0] || ""; }
+    extractCanonicalLink(value) { const text = clean(value); for (const pattern of SHARE_PATTERNS) { pattern.lastIndex = 0; const match = text.match(pattern); if (!match) continue; const raw = match[1]?.startsWith("/") ? `https://www.roblox.com${match[1]}` : match[0]; return raw.trim().replace(/[),.]+$/g,"").replace(/&amp;/g,"&"); } return ""; }
+    extractSourceMessageId(message,flattenedText) { return String(this.getFirstLogFieldValue(message,["Message ID","Message Id","Deleted Message ID","Deleted Message Id"],flattenedText) || "").match(/\d{14,24}/)?.[0] || ""; }
+    extractMentionPair(text) { const cleanText = clean(text); return cleanText.match(/@[\w.'-]{2,40}\s*\([^\n]+\)/)?.[0] || cleanText.match(/<@!?\d{14,24}>/)?.[0] || ""; }
+    readValue(source,keys) { if (!source) return undefined; const candidates = [source]; try { if (typeof source.toJS === "function") candidates.push(source.toJS()); } catch(_) {} for (const candidate of candidates) { if (!candidate) continue; for (const key of keys) { try { const value = candidate[key]; if (value !== undefined && typeof value !== "function") return value; } catch(_) {} try { if (typeof candidate.get === "function") { const value = candidate.get(key); if (value !== undefined && typeof value !== "function") return value; } } catch(_) {} } } return undefined; }
+    readText(source,keys) { const value = this.readValue(source,keys); if (value === undefined || value === null) return ""; if (typeof value === "string") return value; if (typeof value === "number" || typeof value === "boolean") return String(value); try { if (typeof value.toString === "function" && value.toString !== Object.prototype.toString) { const text = value.toString(); return text === "[object Object]" ? "" : text; } } catch(_) {} return ""; }
+    toArray(value) { if (!value) return []; if (Array.isArray(value)) return value; if (value instanceof Map || value instanceof Set) return Array.from(value.values()); try { if (typeof value.toArray === "function") return value.toArray(); } catch(_) {} try { if (typeof value.toJS === "function") { const raw = value.toJS(); return Array.isArray(raw) ? raw : (raw && typeof raw === "object" ? Object.values(raw) : []); } } catch(_) {} return typeof value === "object" ? Object.values(value) : []; }
+    getGuildId() { return String(location?.pathname || "").match(/\/channels\/(\d+)/)?.[1] || ""; }
 };
