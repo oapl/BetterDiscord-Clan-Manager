@@ -2,7 +2,7 @@
  * @name OfficerMode
  * @author Codex
  * @description Adds a toggleable officer desk for ticket and application channels while keeping the main chat readable.
- * @version 0.2.6
+ * @version 0.3.5
  */
 
 const PLUGIN_NAME = "OfficerMode";
@@ -10,6 +10,8 @@ const SETTINGS_KEY = "settings";
 const STYLE_ID = "OfficerMode";
 const DISCORD_EPOCH = 1420070400000n;
 const SHARE_SCAN_DATA_KEY = "robloxShareScan";
+const SHARE_WEBHOOK_STATE_KEY = "robloxShareWebhookState";
+const SHARE_LIVE_MATCHES_KEY = "robloxShareLiveMatches";
 const ROBLOX_SHARE_SCAN = {
     SERVER_LOGS_CHANNEL_ID: "1489879731569426485",
     EGG_CHAT_CHANNEL_ID: "1515759898565148884",
@@ -24,6 +26,14 @@ const ROBLOX_SHARE_SCAN = {
     END_MS: new Date(2026, 5, 19, 10, 0, 0).getTime(),
     PAGE_LIMIT: 100,
     MAX_PAGES: 800
+};
+const SHARE_WEBHOOK_UPDATE = {
+    ENABLED: true,
+    WEBHOOK_URL: "https://discord.com/api/webhooks/1516824540947415101/1mxc2SGV5_RmQ9FYf0XjeYvkV69ljbLauJapX4uFX0cUXRe2tVcMTw0QAAuSfpezXtHa",
+    THREAD_ID: "1504955979597349166",
+    INTERVAL_MS: 15 * 60 * 1000,
+    STARTUP_DELAY_MS: 30000,
+    CONTENT_LIMIT: 1950
 };
 
 const CHANNEL_TYPES = {
@@ -719,7 +729,15 @@ function toMessageArray(value, output = [], seen = new Set(), depth = 0) {
         catch (_) {}
     }
 
-    if (value.id && (value.content !== undefined || value.embeds !== undefined || value.timestamp !== undefined)) {
+    if (value.id && (
+        value.content !== undefined
+        || value.embeds !== undefined
+        || value.timestamp !== undefined
+        || value.messageSnapshot !== undefined
+        || value.message_snapshot !== undefined
+        || value.messageSnapshots !== undefined
+        || value.message_snapshots !== undefined
+    )) {
         output.push(value);
         return output;
     }
@@ -851,7 +869,10 @@ module.exports = class OfficerMode {
         this.modules = {};
         this.unsubscribe = [];
         this.interval = null;
+        this.shareWebhookInterval = null;
+        this.shareWebhookStartupTimeout = null;
         this.shareScanRunning = false;
+        this.shareWebhookUpdating = false;
         this.onStoreChange = debounce(() => {
             if (this.settings.enabled) this.render();
             else this.renderToggle();
@@ -873,6 +894,7 @@ module.exports = class OfficerMode {
         this.interval = setInterval(() => {
             if (this.settings.enabled) this.render();
         }, 60000);
+        this.startShareWebhookAutoUpdate();
         document.addEventListener("keydown", this.onKeyDown);
         window.addEventListener("resize", this.onResize);
         this.render();
@@ -883,6 +905,7 @@ module.exports = class OfficerMode {
         window.removeEventListener("resize", this.onResize);
         clearInterval(this.interval);
         this.interval = null;
+        this.stopShareWebhookAutoUpdate();
         this.unsubscribeFromStores();
         this.unmount();
         BdApi.DOM.removeStyle(STYLE_ID);
@@ -1944,7 +1967,7 @@ module.exports = class OfficerMode {
     }
 
     async runRobloxShareScan() {
-        if (this.shareScanRunning) return;
+        if (this.shareScanRunning || this.shareWebhookUpdating) return;
 
         this.shareScanRunning = true;
         this.render();
@@ -1954,6 +1977,18 @@ module.exports = class OfficerMode {
             const result = await this.scanRobloxShareLogs();
             BdApi.Data.save(PLUGIN_NAME, SHARE_SCAN_DATA_KEY, result);
             this.exportShareScanResult(result);
+            let webhookUpdated = false;
+            try {
+                await this.updateShareLeaderboardWebhook(result);
+                webhookUpdated = true;
+            }
+            catch (webhookError) {
+                console.error(`${PLUGIN_NAME} share webhook update failed`, webhookError);
+                BdApi.UI?.showToast?.(
+                    `Share scan complete, but webhook update failed: ${webhookError?.message || "unknown error"}`,
+                    {type: "error", timeout: 8000}
+                );
+            }
 
             try {
                 await navigator.clipboard?.writeText?.(this.formatShareScanSummary(result));
@@ -1961,7 +1996,7 @@ module.exports = class OfficerMode {
             catch (_) {}
 
             BdApi.UI?.showToast?.(
-                `Share scan complete: ${result.totalMatches} posts across ${result.summary.length} members.`,
+                `Share scan complete: ${result.totalMatches} posts across ${result.summary.length} members.${webhookUpdated ? " Webhook updated." : ""}`,
                 {type: "success"}
             );
         }
@@ -1973,6 +2008,197 @@ module.exports = class OfficerMode {
             this.shareScanRunning = false;
             this.render();
         }
+    }
+
+    startShareWebhookAutoUpdate() {
+        this.stopShareWebhookAutoUpdate();
+        if (!SHARE_WEBHOOK_UPDATE.ENABLED || !SHARE_WEBHOOK_UPDATE.WEBHOOK_URL) return;
+
+        this.shareWebhookStartupTimeout = setTimeout(() => {
+            this.runScheduledShareWebhookUpdate("startup");
+        }, SHARE_WEBHOOK_UPDATE.STARTUP_DELAY_MS);
+        this.shareWebhookInterval = setInterval(() => {
+            this.runScheduledShareWebhookUpdate("interval");
+        }, SHARE_WEBHOOK_UPDATE.INTERVAL_MS);
+    }
+
+    stopShareWebhookAutoUpdate() {
+        clearTimeout(this.shareWebhookStartupTimeout);
+        clearInterval(this.shareWebhookInterval);
+        this.shareWebhookStartupTimeout = null;
+        this.shareWebhookInterval = null;
+    }
+
+    async runScheduledShareWebhookUpdate(reason = "interval") {
+        if (this.shareWebhookUpdating || this.shareScanRunning) return;
+        this.shareWebhookUpdating = true;
+        this.shareScanRunning = true;
+        this.render();
+
+        try {
+            const result = await this.scanRobloxShareLogs();
+            BdApi.Data.save(PLUGIN_NAME, SHARE_SCAN_DATA_KEY, result);
+            await this.updateShareLeaderboardWebhook(result);
+        }
+        catch (error) {
+            console.error(`${PLUGIN_NAME} scheduled share webhook update failed (${reason})`, error);
+            const state = this.loadShareWebhookState();
+            this.saveShareWebhookState(Object.assign({}, state, {
+                lastError: error?.message || String(error || "unknown error"),
+                lastErrorAt: new Date().toISOString()
+            }));
+        }
+        finally {
+            this.shareWebhookUpdating = false;
+            this.shareScanRunning = false;
+            this.render();
+        }
+    }
+
+    async updateShareLeaderboardWebhook(result) {
+        if (!SHARE_WEBHOOK_UPDATE.ENABLED || !SHARE_WEBHOOK_UPDATE.WEBHOOK_URL) return null;
+
+        const payload = {
+            content: this.formatShareLeaderboardWebhookContent(result),
+            allowed_mentions: {parse: []}
+        };
+        const state = this.loadShareWebhookState();
+        let message = null;
+
+        if (state.messageId) {
+            try {
+                message = await this.sendShareWebhookRequest(
+                    this.getShareWebhookMessageUrl(state.messageId),
+                    "PATCH",
+                    payload
+                );
+            }
+            catch (error) {
+                if (error?.status !== 404 && !/Unknown Message/i.test(error?.message || "")) throw error;
+                state.messageId = "";
+            }
+        }
+
+        if (!message) {
+            message = await this.sendShareWebhookRequest(
+                this.getShareWebhookCreateUrl(),
+                "POST",
+                payload
+            );
+        }
+
+        const messageId = message?.id || state.messageId || "";
+        const nextState = Object.assign({}, state, {
+            messageId,
+            threadId: SHARE_WEBHOOK_UPDATE.THREAD_ID || "",
+            lastUpdatedAt: new Date().toISOString(),
+            lastTotalMatches: result.totalMatches || 0,
+            lastAuthorCount: result.summary?.length || 0,
+            lastError: ""
+        });
+        this.saveShareWebhookState(nextState);
+        return nextState;
+    }
+
+    getShareWebhookCreateUrl() {
+        const base = SHARE_WEBHOOK_UPDATE.WEBHOOK_URL.replace(/\/+$/, "");
+        const params = new URLSearchParams({wait: "true"});
+        if (SHARE_WEBHOOK_UPDATE.THREAD_ID) params.set("thread_id", SHARE_WEBHOOK_UPDATE.THREAD_ID);
+        return `${base}?${params.toString()}`;
+    }
+
+    getShareWebhookMessageUrl(messageId) {
+        const base = SHARE_WEBHOOK_UPDATE.WEBHOOK_URL.replace(/\/+$/, "");
+        const params = new URLSearchParams();
+        if (SHARE_WEBHOOK_UPDATE.THREAD_ID) params.set("thread_id", SHARE_WEBHOOK_UPDATE.THREAD_ID);
+        const query = params.toString();
+        return `${base}/messages/${encodeURIComponent(messageId)}${query ? `?${query}` : ""}`;
+    }
+
+    async sendShareWebhookRequest(url, method, payload) {
+        const options = {
+            method,
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        };
+        const attempts = [];
+        if (typeof fetch === "function") attempts.push(["fetch", () => fetch(url, options)]);
+        if (typeof BdApi !== "undefined" && typeof BdApi.Net?.fetch === "function") {
+            attempts.push(["BdApi.Net.fetch", () => BdApi.Net.fetch(url, options)]);
+        }
+
+        let lastError = null;
+        for (const [name, attempt] of attempts) {
+            try {
+                const response = await attempt();
+                const data = await this.readFetchResponse(response);
+                const status = response?.status || response?.statusCode || data?.status || 0;
+                const ok = response?.ok ?? (!status || (status >= 200 && status < 300));
+                if (!ok || data?.code || data?.message && status >= 400) {
+                    const message = data?.message || `HTTP ${status || "unknown"}`;
+                    const error = new Error(`Webhook ${method} failed via ${name}: ${status || ""} ${message}`.trim());
+                    error.status = status;
+                    error.data = data;
+                    throw error;
+                }
+                return data || {};
+            }
+            catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError || new Error(`Webhook ${method} failed: no request method available`);
+    }
+
+    loadShareWebhookState() {
+        try {
+            return BdApi.Data.load(PLUGIN_NAME, SHARE_WEBHOOK_STATE_KEY) || {};
+        }
+        catch (_) {
+            return {};
+        }
+    }
+
+    saveShareWebhookState(state) {
+        BdApi.Data.save(PLUGIN_NAME, SHARE_WEBHOOK_STATE_KEY, state || {});
+    }
+
+    formatShareLeaderboardWebhookContent(result) {
+        const updatedUnix = Math.floor(Date.now() / 1000);
+        const header = [
+            "**C0LD Egg Server Leaderboard**",
+            `_Updated <t:${updatedUnix}:R>_`,
+            "",
+            "```text",
+            `${"rank".padEnd(5)} ${"author".padEnd(46)} total`
+        ];
+        const footer = ["```"];
+        const lines = header.slice();
+        const rows = Array.isArray(result?.summary) ? result.summary : [];
+
+        for (let index = 0; index < rows.length; index += 1) {
+            const row = rows[index];
+            const author = this.truncateWebhookCell(row.author || row.authorKey || "Unknown author", 46);
+            const total = String(row.totalCount || row.count || 0);
+            const line = `${String(index + 1).padEnd(5)} ${author.padEnd(46)} ${total}`;
+            const candidate = lines.concat(line, footer).join("\n");
+            if (candidate.length > SHARE_WEBHOOK_UPDATE.CONTENT_LIMIT) break;
+            lines.push(line);
+        }
+
+        if (lines.length === header.length) {
+            lines.push(`${"-".padEnd(5)} ${"No matching posts yet".padEnd(46)} 0`);
+        }
+
+        lines.push(...footer);
+        return lines.join("\n");
+    }
+
+    truncateWebhookCell(value, maxLength) {
+        const text = cleanLogText(value).replace(/\s+/g, " ").replace(/`/g, "'").trim();
+        if (text.length <= maxLength) return text;
+        return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
     }
 
     async scanRobloxShareLogs() {
@@ -1990,6 +2216,7 @@ module.exports = class OfficerMode {
             liveEggShareMessages: 0,
             fetches: [],
             liveFetches: [],
+            liveAudit: [],
             authorAudit: [],
             samples: []
         };
@@ -2057,7 +2284,7 @@ module.exports = class OfficerMode {
         }
 
         const liveResult = await this.scanLiveEggChatShares(startMs, endMs, diagnostics, generatedAtMs);
-        const liveMatches = liveResult.matches;
+        const liveMatches = this.mergeStoredLiveShareMatches(liveResult.matches, startMs, endMs, Math.min(generatedAtMs, endMs), diagnostics);
         const summary = this.summarizeShareScanMatches(matches, liveMatches);
         return {
             generatedAt: new Date().toISOString(),
@@ -2088,6 +2315,9 @@ module.exports = class OfficerMode {
     async scanLiveEggChatShares(startMs, endMs, diagnostics, generatedAtMs = Date.now()) {
         const activeUntilMs = Math.min(generatedAtMs, endMs);
         const matches = [];
+        const messagesInWindow = new Map();
+        let authorBeforeWindow = null;
+        let authorBeforeWindowTimestamp = 0;
         let before = timestampToSnowflake(activeUntilMs + 1) || "";
         let scannedMessages = 0;
         let pages = 0;
@@ -2101,7 +2331,7 @@ module.exports = class OfficerMode {
                 page: pages + 1,
                 before,
                 expectMessages: true,
-                internalOnly: true,
+                internalOnly: false,
                 attempts: []
             };
             diagnostics.liveFetches.push(fetchDetail);
@@ -2129,15 +2359,16 @@ module.exports = class OfficerMode {
                 const timestamp = timestampFromMessage(message);
                 if (timestamp && timestamp < startMs) {
                     reachedStart = true;
+                    const explicitAuthor = this.getLiveMessageAuthorContext(message);
+                    if (explicitAuthor && timestamp > authorBeforeWindowTimestamp) {
+                        authorBeforeWindow = explicitAuthor;
+                        authorBeforeWindowTimestamp = timestamp;
+                    }
                     continue;
                 }
                 if (!timestamp || timestamp > activeUntilMs || timestamp > endMs || timestamp < startMs) continue;
 
-                diagnostics.liveEggChannelMessages += 1;
-                const match = this.getRobloxShareLiveMatch(message, timestamp, activeUntilMs);
-                if (!match) continue;
-                diagnostics.liveEggShareMessages += 1;
-                matches.push(match);
+                messagesInWindow.set(message.id, {message, timestamp});
             }
 
             before = messages[messages.length - 1]?.id || "";
@@ -2153,6 +2384,21 @@ module.exports = class OfficerMode {
                     : "completed";
         }
 
+        // Walk in display order so grouped posts can inherit the nearest visible author above them.
+        let authorAbove = authorBeforeWindow;
+        const orderedMessages = Array.from(messagesInWindow.values())
+            .sort((a, b) => a.timestamp - b.timestamp);
+        for (const {message, timestamp} of orderedMessages) {
+            diagnostics.liveEggChannelMessages += 1;
+            const explicitAuthor = this.getLiveMessageAuthorContext(message);
+            const match = this.getRobloxShareLiveMatch(message, timestamp, activeUntilMs, authorAbove);
+            this.recordLiveEggChatAudit(diagnostics, message, timestamp, explicitAuthor, authorAbove, match);
+            if (explicitAuthor) authorAbove = explicitAuthor;
+            if (!match) continue;
+            diagnostics.liveEggShareMessages += 1;
+            matches.push(match);
+        }
+
         return {
             matches,
             pagesScanned: pages,
@@ -2162,28 +2408,103 @@ module.exports = class OfficerMode {
         };
     }
 
+    mergeStoredLiveShareMatches(currentMatches, startMs, endMs, activeUntilMs, diagnostics = {}) {
+        const current = Array.isArray(currentMatches) ? currentMatches : [];
+        const stored = this.loadStoredLiveShareMatches();
+        const currentIds = new Set(current.map(match => match?.liveMessageId).filter(Boolean));
+        const byMessageId = new Map();
+
+        for (const match of stored.concat(current)) {
+            const normalized = this.normalizeStoredLiveShareMatch(match, startMs, endMs, activeUntilMs);
+            if (!normalized) continue;
+            byMessageId.set(normalized.liveMessageId, normalized);
+        }
+
+        const merged = Array.from(byMessageId.values())
+            .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
+        this.saveStoredLiveShareMatches(merged);
+
+        diagnostics.currentLiveMatches = current.length;
+        diagnostics.storedLiveMatchesBeforeMerge = stored.length;
+        diagnostics.storedLiveMatchesAfterMerge = merged.length;
+        diagnostics.reusedStoredLiveMatches = merged.filter(match => !currentIds.has(match.liveMessageId)).length;
+        return merged;
+    }
+
+    normalizeStoredLiveShareMatch(match, startMs, endMs, activeUntilMs) {
+        if (!match?.liveMessageId) return null;
+        const timestamp = Date.parse(match.timestamp || "");
+        if (!Number.isFinite(timestamp) || timestamp < startMs || timestamp > endMs) return null;
+        const activeMs = Math.max(0, activeUntilMs - timestamp);
+        const author = match.author || "Unknown author";
+        const authorKey = match.authorKey || this.normalizeShareAuthorKey(author);
+        return Object.assign({}, match, {
+            source: "egg-chat-live",
+            author,
+            authorKey,
+            timestamp: new Date(timestamp).toISOString(),
+            activeMs,
+            activeDuration: formatDuration(activeMs)
+        });
+    }
+
+    loadStoredLiveShareMatches() {
+        try {
+            const value = BdApi.Data.load(PLUGIN_NAME, SHARE_LIVE_MATCHES_KEY);
+            return Array.isArray(value) ? value : [];
+        }
+        catch (_) {
+            return [];
+        }
+    }
+
+    saveStoredLiveShareMatches(matches) {
+        BdApi.Data.save(PLUGIN_NAME, SHARE_LIVE_MATCHES_KEY, Array.isArray(matches) ? matches : []);
+    }
+
     extractDiscordMessages(response) {
         const value = this.normalizeDiscordResponse(response);
         if (Array.isArray(value)) return value;
         if (Array.isArray(value?.body)) return value.body;
         if (Array.isArray(value?.data)) return value.data;
         if (Array.isArray(value?.messages)) {
-            return value.messages.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+            return value.messages.flat(Infinity).filter(item => this.looksLikeDiscordMessage(item));
         }
         if (Array.isArray(value?.body?.messages)) {
-            return value.body.messages.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+            return value.body.messages.flat(Infinity).filter(item => this.looksLikeDiscordMessage(item));
         }
         if (Array.isArray(value?.results)) {
-            return value.results.flat(Infinity).filter(item => item?.id && (item.content !== undefined || item.embeds !== undefined));
+            return value.results.flat(Infinity).filter(item => this.looksLikeDiscordMessage(item));
         }
         return [];
     }
 
+    looksLikeDiscordMessage(item) {
+        return Boolean(item?.id && (
+            item.content !== undefined
+            || item.embeds !== undefined
+            || item.timestamp !== undefined
+            || item.messageSnapshot !== undefined
+            || item.message_snapshot !== undefined
+            || item.messageSnapshots !== undefined
+            || item.message_snapshots !== undefined
+        ));
+    }
+
     async fetchMessagesWithDiscordActions(channelId, before, detail = {}) {
+        const apiMessages = await this.fetchDiscordMessagePage(channelId, before, detail);
+        if (apiMessages.length) {
+            const cachedMessages = this.getCachedMessagesForChannel(channelId, before);
+            this.recordActionAttempt(detail, "message cache supplement", cachedMessages.length, "");
+            return this.filterMessagePage(apiMessages.concat(cachedMessages), before);
+        }
+
         const actions = this.modules.MessageActions;
         if (!actions) {
             this.recordActionAttempt(detail, "message actions unavailable", 0, "");
-            return [];
+            const cachedMessages = this.getCachedMessagesForChannel(channelId, before);
+            this.recordActionAttempt(detail, "message cache final", cachedMessages.length, "");
+            return cachedMessages;
         }
 
         const methods = ["fetchMessages", "loadMessages"].filter(method => typeof actions[method] === "function");
@@ -2211,6 +2532,24 @@ module.exports = class OfficerMode {
         const cachedMessages = this.getCachedMessagesForChannel(channelId, before);
         this.recordActionAttempt(detail, "message cache final", cachedMessages.length, "");
         return cachedMessages;
+    }
+
+    async fetchDiscordMessagePage(channelId, before, detail = {}) {
+        const endpoint = [
+            `/channels/${channelId}/messages?limit=${ROBLOX_SHARE_SCAN.PAGE_LIMIT}`,
+            before ? `&before=${before}` : ""
+        ].join("");
+        detail.expectMessages = true;
+        detail.internalOnly = false;
+
+        try {
+            const response = await this.fetchDiscordEndpoint(endpoint, detail);
+            return this.filterMessagePage(this.extractDiscordMessages(response), before);
+        }
+        catch (error) {
+            this.recordActionAttempt(detail, "discord api message page failed", 0, "", error);
+            return [];
+        }
     }
 
     extractActionMessages(result, channelId, before) {
@@ -2324,14 +2663,14 @@ module.exports = class OfficerMode {
         };
     }
 
-    getRobloxShareLiveMatch(message, timestamp, activeUntilMs) {
+    getRobloxShareLiveMatch(message, timestamp, activeUntilMs, fallbackAuthor = null) {
         const text = this.flattenDiscordMessage(message);
         const shareMessage = this.getShareMessageValue([], text);
         if (!shareMessage || !this.hasSupportedRobloxShareLink(shareMessage)) return null;
 
-        const authorLine = this.getLiveMessageAuthorLine(message);
-        const authorId = this.getLiveMessageAuthorId(message);
-        const authorKey = authorId ? `<@${authorId}>` : this.normalizeShareAuthorKey(authorLine);
+        const author = this.getLiveMessageAuthorContext(message) || fallbackAuthor;
+        const authorLine = author?.line || "Unknown author";
+        const authorKey = author?.key || this.normalizeShareAuthorKey(authorLine);
         const guildId = this.getGuildId() || this.getChannelGuildId(message) || "@me";
         const activeMs = Math.max(0, activeUntilMs - timestamp);
         return {
@@ -2347,19 +2686,75 @@ module.exports = class OfficerMode {
         };
     }
 
-    getLiveMessageAuthorId(message) {
-        const author = this.readObjectValue(message, ["author"]) || {};
-        return this.readTextValue(author, ["id"]) || this.readTextValue(message, ["authorId", "author_id"]);
+    recordLiveEggChatAudit(diagnostics, message, timestamp, explicitAuthor, fallbackAuthor, match) {
+        if (!diagnostics?.liveAudit || diagnostics.liveAudit.length >= 100000) return;
+        const text = this.flattenDiscordMessage(message);
+        const shareMessage = this.getShareMessageValue([], text);
+        const author = explicitAuthor || fallbackAuthor;
+        const robloxLine = text.split("\n").find(line => /roblox\.com/i.test(line)) || "";
+        const snapshotKeys = [
+            "messageSnapshot",
+            "message_snapshot",
+            "messageSnapshots",
+            "message_snapshots",
+            "forwardedMessage",
+            "forwarded_message",
+            "forwardedMessages",
+            "forwarded_messages"
+        ].filter(key => this.readObjectValue(message, [key]) !== undefined);
+
+        diagnostics.liveAudit.push({
+            eggChatMessageId: message?.id || "",
+            timestamp: timestamp ? new Date(timestamp).toISOString() : "",
+            counted: match ? "yes" : "no",
+            reason: match
+                ? "counted"
+                : robloxLine
+                    ? "roblox text did not match supported patterns"
+                    : text
+                        ? "no roblox link text found"
+                        : "no readable text",
+            author: author?.line || "Unknown author",
+            usedFallbackAuthor: !explicitAuthor && fallbackAuthor ? "yes" : "no",
+            hasRobloxText: robloxLine ? "yes" : "no",
+            hasSupportedShareLink: shareMessage && this.hasSupportedRobloxShareLink(shareMessage) ? "yes" : "no",
+            extractedShareMessage: shareMessage || "",
+            robloxLine,
+            snapshotKeys: snapshotKeys.join(" "),
+            messageKeys: message && typeof message === "object" ? Object.keys(message).slice(0, 40).join(" ") : "",
+            preview: text.slice(0, 700)
+        });
     }
 
-    getLiveMessageAuthorLine(message) {
+    getLiveMessageAuthorContext(message) {
         const author = this.readObjectValue(message, ["author"]) || {};
         const username = this.readTextValue(author, ["username", "name", "tag"]);
         const globalName = this.readTextValue(author, ["globalName", "global_name", "displayName", "nick"]);
         const authorId = this.getLiveMessageAuthorId(message);
-        if (globalName && username && globalName !== username) return `${globalName} (@${username})${authorId ? ` (<@${authorId}>)` : ""}`;
-        if (username) return `${username}${authorId ? ` (<@${authorId}>)` : ""}`;
-        return authorId ? `<@${authorId}>` : "Unknown author";
+        if (!authorId && !username && !globalName) return null;
+
+        let line = "";
+        if (globalName && username && globalName !== username) line = `${globalName} (@${username})${authorId ? ` (<@${authorId}>)` : ""}`;
+        else if (globalName) line = `${globalName}${authorId ? ` (<@${authorId}>)` : ""}`;
+        else if (username) line = `${username}${authorId ? ` (<@${authorId}>)` : ""}`;
+        else line = `<@${authorId}>`;
+
+        return {
+            id: authorId,
+            line,
+            key: authorId ? `<@${authorId}>` : this.normalizeShareAuthorKey(line)
+        };
+    }
+
+    getLiveMessageAuthorId(message) {
+        const rawAuthor = this.readObjectValue(message, ["author"]);
+        if (typeof rawAuthor === "string" && /^\d{14,24}$/.test(rawAuthor)) return rawAuthor;
+        const author = rawAuthor || {};
+        return this.readTextValue(author, ["id"]) || this.readTextValue(message, ["authorId", "author_id"]);
+    }
+
+    getLiveMessageAuthorLine(message) {
+        return this.getLiveMessageAuthorContext(message)?.line || "Unknown author";
     }
 
     recordRobloxShareAuthorAudit(diagnostics, message, timestamp, inspection, match) {
@@ -2395,8 +2790,26 @@ module.exports = class OfficerMode {
     }
 
     flattenDiscordMessage(message) {
-        const parts = [this.readTextValue(message, ["content", "cleanContent"])];
-        for (const embed of this.toSimpleArray(this.readObjectValue(message, ["embeds"]))) {
+        const parts = [];
+        this.collectDiscordMessageTextParts(message, parts);
+        return cleanLogText(parts.filter(Boolean).join("\n"));
+    }
+
+    collectDiscordMessageTextParts(source, parts, seen = new Set(), depth = 0) {
+        if (!source || depth > 5) return;
+        if (typeof source === "string") {
+            parts.push(source);
+            return;
+        }
+        if (Array.isArray(source) || source instanceof Map || source instanceof Set) {
+            for (const item of this.toSimpleArray(source)) this.collectDiscordMessageTextParts(item, parts, seen, depth + 1);
+            return;
+        }
+        if (typeof source !== "object" || seen.has(source)) return;
+        seen.add(source);
+
+        parts.push(this.readTextValue(source, ["content", "cleanContent", "rawContent", "text"]));
+        for (const embed of this.toSimpleArray(this.readObjectValue(source, ["embeds", "rawEmbeds"]))) {
             parts.push(
                 this.readTextValue(embed, ["title", "rawTitle"]),
                 this.readTextValue(embed, ["description", "rawDescription"]),
@@ -2411,7 +2824,44 @@ module.exports = class OfficerMode {
                 if (name || value) parts.push(`${name}: ${value}`);
             }
         }
-        return cleanLogText(parts.filter(Boolean).join("\n"));
+
+        for (const attachment of this.toSimpleArray(this.readObjectValue(source, ["attachments", "rawAttachments"]))) {
+            parts.push(
+                this.readTextValue(attachment, ["url", "rawUrl"]),
+                this.readTextValue(attachment, ["proxyUrl", "proxy_url"]),
+                this.readTextValue(attachment, ["filename", "name", "title", "description"])
+            );
+        }
+
+        for (const nestedKey of [
+            "messageSnapshots",
+            "message_snapshots",
+            "messageSnapshot",
+            "message_snapshot",
+            "snapshots",
+            "forwardedMessages",
+            "forwarded_messages",
+            "forwardedMessage",
+            "forwarded_message"
+        ]) {
+            for (const snapshot of this.toSimpleArray(this.readObjectValue(source, [nestedKey]))) {
+                this.collectDiscordMessageTextParts(snapshot, parts, seen, depth + 1);
+            }
+        }
+
+        for (const nestedKey of [
+            "message",
+            "snapshot",
+            "sourceMessage",
+            "source_message",
+            "referencedMessage",
+            "referenced_message",
+            "originalMessage",
+            "original_message"
+        ]) {
+            const nested = this.readObjectValue(source, [nestedKey]);
+            if (nested) this.collectDiscordMessageTextParts(nested, parts, seen, depth + 1);
+        }
     }
 
     getLogFieldValues(message, label, flattenedText = "") {
@@ -2651,7 +3101,6 @@ module.exports = class OfficerMode {
             ["count", row => row.count],
             ["egg_chat_live_count", row => row.eggChatLiveCount || 0],
             ["egg_chat_live_time", row => row.liveActiveTime || ""],
-            ["egg_chat_live_time_ms", row => row.liveActiveMs || 0],
             ["total_count", row => row.totalCount || row.count],
             ["first_timestamp", row => row.firstTimestamp],
             ["last_timestamp", row => row.lastTimestamp],
@@ -2692,6 +3141,24 @@ module.exports = class OfficerMode {
             ["endpoint", row => row.endpoint]
         ]);
         this.downloadTextFile(`roblox-share-status-${stamp}.csv`, statusCsv, "text/csv;charset=utf-8");
+        if (result.diagnostics?.liveAudit?.length) {
+            const liveAuditCsv = this.makeCsv(result.diagnostics.liveAudit, [
+                ["egg_chat_message_id", row => row.eggChatMessageId],
+                ["timestamp", row => row.timestamp],
+                ["counted", row => row.counted],
+                ["reason", row => row.reason],
+                ["author", row => row.author],
+                ["used_fallback_author", row => row.usedFallbackAuthor],
+                ["has_roblox_text", row => row.hasRobloxText],
+                ["has_supported_share_link", row => row.hasSupportedShareLink],
+                ["extracted_share_message", row => row.extractedShareMessage],
+                ["roblox_line", row => row.robloxLine],
+                ["snapshot_keys", row => row.snapshotKeys],
+                ["message_keys", row => row.messageKeys],
+                ["preview", row => row.preview]
+            ]);
+            this.downloadTextFile(`roblox-share-live-audit-${stamp}.csv`, liveAuditCsv, "text/csv;charset=utf-8");
+        }
         if (result.diagnostics?.authorAudit?.length) {
             const auditCsv = this.makeCsv(result.diagnostics.authorAudit, [
                 ["audit_ids", row => row.auditIds],
