@@ -1,7 +1,7 @@
 /**
- * @name RobloxShareLeaderboard
- * @author ChatGPT
- * @description Webhook-only leaderboard scanner for C0LD egg-chat. Counts any link or video attachment/link in live/deleted egg-chat posts.
+ * @name c0ld server leaderboard
+ * @author oapl
+ * @description i hate my life
  * @version 0.5.0
  */
 
